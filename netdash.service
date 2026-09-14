@@ -1,0 +1,17 @@
+[Unit]
+Description=netdash - home network dashboard
+After=network-online.target pihole-FTL.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=darren
+WorkingDirectory=/opt/netdash
+EnvironmentFile=/opt/netdash/config.env
+ExecStart=/opt/netdash/venv/bin/uvicorn app:app --host 0.0.0.0 --port 8080 --log-level warning
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target

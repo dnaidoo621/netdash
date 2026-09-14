@@ -1,0 +1,17 @@
+# Secrets — never commit. Copy config.env.example to config.env on the host.
+config.env
+
+# Runtime state
+netdash.db
+netdash.db-*
+*.log
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
