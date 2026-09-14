@@ -4,9 +4,11 @@ A single-page, self-hosted home network dashboard. One glance answers *"is it my
 
 Built for a low-power always-on box (in my case an old laptop running Pi-hole and a Tailscale exit node). One Python process, SQLite, no external assets — **the page still renders when the internet is down**, which is precisely when you'll be looking at it.
 
-![Overview — status tiles, WAN health, line usage, Pi-hole queries](docs/overview.png)
+![Overview — verdict, status tiles, and the auto-detected service status strips](docs/overview.png)
 
 ![Devices with per-client signal and rate, and the WiFi stability table](docs/devices.png)
+
+![Incidents — outages grouped with duration, cause, and a 7-day uptime summary](docs/incidents.png)
 
 <details>
 <summary>TV mode (1080p, sofa distance)</summary>
