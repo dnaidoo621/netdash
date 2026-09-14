@@ -223,6 +223,9 @@ class Collector:
         if time.time() - self.router_info_ts > 300:
             wan, sysinfo, mesh = await asyncio.gather(
                 router.wan_status(), router.system(), router.mesh())
+            # Never surface the public IP or router MAC through the dashboard API.
+            for k in ("Public IP", "MAC-Address"):
+                wan.pop(k, None)
             if wan or sysinfo or mesh:
                 self.router_info = {"wan": wan, "system": sysinfo, "mesh": mesh,
                                     "fetched": ts}
@@ -468,6 +471,9 @@ async def router_wifi(hours: float = Query(24, ge=1, le=336)):
     sig = rows("SELECT mac, MIN(signal_db) worst, AVG(signal_db) avg, MAX(signal_db) best "
                "FROM router_devices WHERE ts>? AND signal_db IS NOT NULL GROUP BY mac", s)
     now = {d["mac"]: d for d in collector.router_devices_now}
+    ph = await pihole.safe("/api/network/devices", {"max_devices": 100, "max_addresses": 1})
+    vendor = {(d.get("hwaddr") or "").upper(): d.get("macVendor") or ""
+              for d in ph.get("devices", [])}
     by = {}
     for r in drops:
         by.setdefault(r["mac"], {}).update(drops=r["n"], worst_drop_rssi=r["worst_drop_rssi"],
@@ -479,6 +485,7 @@ async def router_wifi(hours: float = Query(24, ge=1, le=336)):
     for mac, v in by.items():
         d = now.get(mac, {})
         out.append({"mac": mac, "ip": d.get("ip", ""), "name": d.get("name", ""),
+                    "vendor": vendor.get(mac, ""),
                     "band": d.get("band", ""), "online": mac in now,
                     "signal_now": d.get("signal_db"),
                     "drops": v.get("drops", 0), "worst_drop_rssi": v.get("worst_drop_rssi"),

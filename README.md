@@ -4,6 +4,18 @@ A single-page, self-hosted home network dashboard. One glance answers *"is it my
 
 Built for a low-power always-on box (in my case an old laptop running Pi-hole and a Tailscale exit node). One Python process, SQLite, no external assets — **the page still renders when the internet is down**, which is precisely when you'll be looking at it.
 
+![Overview — status tiles, WAN health, line usage, Pi-hole queries](docs/overview.png)
+
+![Devices with per-client signal and rate, and the WiFi stability table](docs/devices.png)
+
+<details>
+<summary>TV mode (1080p, sofa distance)</summary>
+
+![TV mode](docs/tv-mode.png)
+</details>
+
+*Screenshots taken with `?demo=1`, which anonymises hostnames and MACs — see below.*
+
 ## What it shows
 
 **Top row — the glance**
@@ -67,6 +79,14 @@ http://<host>:8080/?tv=1
 ```
 
 It persists in that browser's `localStorage`. Bigger type, four tiles per row, denser panels hidden. There's also a **TV** toggle in the header. Press F11 for full-screen.
+
+### Demo mode (for sharing screenshots)
+
+```
+http://<host>:8080/?demo=1
+```
+
+Replaces hostnames with generic labels by vendor (`Laptop 1`, `iPhone 2`, `Smart plug 1`…), masks MAC addresses, and hides the top-permitted-domains panel (which fingerprints what you use). Per-URL only — never persisted, so the live dashboard is unaffected. The dashboard API also never exposes the WAN public IP or router MAC, regardless of mode.
 
 ## Cudy router integration
 

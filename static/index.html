@@ -103,6 +103,7 @@
   body.tv .list li{padding:8px 0}
   body.tv .list .t{flex-basis:170px;font-size:16px}
   body.tv .tv-hide{display:none}
+  body.demo .demo-hide{display:none}
   body.tv .range button{font-size:14px;padding:4px 12px}
 </style>
 </head>
@@ -201,7 +202,7 @@
       <ul class="list" id="blocked"></ul>
     </div>
 
-    <div class="panel tv-hide">
+    <div class="panel tv-hide demo-hide">
       <h2>Top permitted <span class="r">24h</span></h2>
       <ul class="list" id="permitted"></ul>
     </div>
@@ -220,6 +221,29 @@ const ago = ts => { if(!ts) return '—'; const s=Math.max(0,(Date.now()/1000)-t
 const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 const num = (v,d=1) => (v==null||isNaN(v)) ? '—' : Number(v).toFixed(d);
 async function j(url){ const r=await fetch(url,{cache:'no-store'}); if(!r.ok) throw new Error(url+' '+r.status); return r.json(); }
+
+// ------------------------------------------------------------ demo mode ---
+// ?demo=1 anonymises hostnames and MACs so screenshots can be shared. Per-URL only,
+// never persisted — the live dashboard is unaffected.
+const DEMO = (()=>{ try{ return new URLSearchParams(location.search).has('demo'); }catch(e){ return false; } })();
+if(DEMO) document.body.classList.add('demo');
+const MASK_MAC = '••:••:••:••:••:••';
+const _anonLabel = {}, _anonCount = {};   // mac -> label ; category -> how many so far
+function anonName(x){
+  if(!DEMO) return x.name;
+  if(['htpc','pi.hole','localhost'].includes(x.name)) return x.name;
+  if(_anonLabel[x.mac]) return _anonLabel[x.mac];      // stable across refreshes
+  const v=(x.vendor||'').toLowerCase(), n=(x.name||'').toLowerCase();
+  const cat = /cudy/.test(v) ? 'Router'
+            : /tuya/.test(v) ? 'Smart plug'
+            : /apple/.test(v) ? 'iPhone'
+            : /webos|lg electronics/.test(n+' '+v) ? 'TV'
+            : /intel|microsoft|dell|lenovo|hp inc/.test(v) ? 'Laptop'
+            : 'Device';
+  _anonCount[cat] = (_anonCount[cat]||0)+1;
+  return (_anonLabel[x.mac] = cat+' '+_anonCount[cat]);
+}
+const anonMac = m => DEMO ? MASK_MAC : m;
 
 // ------------------------------------------------------------- charts ---
 // Minimal time-series canvas chart. series: [{pts:[[ts,val]], color, width, fill, axis:'l'|'r', bars}]
@@ -370,8 +394,9 @@ async function loadDevices(){
   const recent = devs.filter(x=>x.queries_24h>0 || x.band || (d.now-(x.last_seen||0))<86400*3);
   const rate = k => k==null ? '<span style="color:var(--muted)">—</span>' : k>=1000 ? num(k/1000,1)+' Mb' : num(k,0)+' kb';
   for(const x of recent){ const tr=document.createElement('tr');
+    const nm = anonName(x);
     tr.innerHTML = '<td><span class="dot '+(x.online?'on':'')+'"></span></td>'+
-      '<td>'+(x.name||'<span style="color:var(--muted)">'+x.mac+'</span>')+'</td>'+
+      '<td>'+(nm||'<span style="color:var(--muted)">'+anonMac(x.mac)+'</span>')+'</td>'+
       '<td style="font-variant-numeric:tabular-nums">'+x.ip+'</td>'+
       '<td style="color:var(--dim)">'+(x.band||'<span style="color:var(--muted)">—</span>')+'</td>'+
       '<td class="num">'+sig(x.signal_db)+'</td>'+
@@ -392,8 +417,9 @@ async function loadWifi(){
   $('#wifi-note').textContent = cl.reduce((a,c)=>a+c.drops,0)+' disconnects in 24h across '+cl.length+' clients · signal in dB, higher is better';
   for(const c of cl){ const tr=document.createElement('tr');
     const dropsC = c.drops>=20?'bad':c.drops>=5?'warn':'';
+    const nm = anonName(c);
     tr.innerHTML = '<td><span class="dot '+(c.online?'on':'')+'"></span></td>'+
-      '<td>'+(c.name||'<span style="color:var(--muted)">'+c.mac+'</span>')+(c.ip?' <span style="color:var(--muted);font-size:11px">'+c.ip+'</span>':'')+'</td>'+
+      '<td>'+(nm||'<span style="color:var(--muted)">'+anonMac(c.mac)+'</span>')+(c.ip?' <span style="color:var(--muted);font-size:11px">'+c.ip+'</span>':'')+'</td>'+
       '<td style="color:var(--dim)">'+(c.band||'—')+'</td>'+
       '<td class="num">'+sig(c.signal_now)+'</td>'+
       '<td class="num">'+sig(c.sig_worst)+'</td>'+
