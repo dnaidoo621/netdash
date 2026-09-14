@@ -26,6 +26,10 @@
   .tag{font-size:10px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;color:var(--muted);
     border:1px solid var(--line);border-radius:4px;padding:1px 5px;margin-left:6px;vertical-align:middle}
   .inc-ongoing{color:var(--bad);font-weight:600}
+  tr.clickable{cursor:pointer}
+  tr.clickable:hover td{background:rgba(88,166,255,.06)}
+  tr.detail td{background:var(--panel2);border-bottom:1px solid var(--line)}
+  #report .tile h2{margin-bottom:4px}
   .pill{margin-left:auto;padding:6px 14px;border-radius:999px;font-weight:700;font-size:13px;
     letter-spacing:.5px;background:var(--panel2);border:1px solid var(--line)}
   .pill.up{background:rgba(63,185,80,.15);color:var(--ok);border-color:rgba(63,185,80,.4)}
@@ -152,7 +156,7 @@
     <div class="panel tall">
       <h2>WAN health
         <span class="r range" id="wan-range">
-          <button data-h="6">6h</button><button data-h="24" class="on">24h</button><button data-h="168">7d</button>
+          <button data-h="6">6h</button><button data-h="24" class="on">24h</button><button data-h="168">7d</button><button data-h="720">30d</button><button data-h="2160">90d</button>
         </span>
       </h2>
       <canvas id="c-wan"></canvas>
@@ -218,6 +222,11 @@
         <thead><tr><th>When</th><th class="num">Duration</th><th>Where</th><th>Seen by</th><th>Services affected</th></tr></thead>
         <tbody></tbody>
       </table></div>
+    </div>
+
+    <div class="panel wide">
+      <h2>Last 30 days <span class="r" id="rep-note">what your ISP actually delivered</span></h2>
+      <div class="grid tiles" id="report"></div>
     </div>
 
     <div class="panel">
@@ -303,8 +312,9 @@ function chart(canvas, series, opt={}){
   g.strokeStyle=css('--line'); g.lineWidth=1; g.fillStyle=css('--muted'); g.font='10px sans-serif';
   for(let i=0;i<=4;i++){ const y=y0+(y1-y0)*i/4; g.beginPath(); g.moveTo(x0,y); g.lineTo(x1,y); g.stroke();
     g.textAlign='right'; g.fillText(lab(lTop*(1-i/4)), x0-4, y+3); }
-  if(opt.rightAxis){ g.textAlign='left';
-    for(let i=0;i<=4;i++){ const y=y0+(y1-y0)*i/4; g.fillText(Math.round(rTop*(1-i/4))+'%', x1+4, y+3); } }
+  if(opt.rightAxis){ g.textAlign='left'; const ru = opt.rUnit ?? '%';
+    const rlab = v => (rTop<10 ? v.toFixed(1) : String(Math.round(v))) + ru;
+    for(let i=0;i<=4;i++){ const y=y0+(y1-y0)*i/4; g.fillText(rlab(rTop*(1-i/4)), x1+4, y+3); } }
   const span=tMax-tMin, nLab=Math.min(6,Math.max(2,Math.floor((x1-x0)/90)));
   g.textAlign='center';
   for(let i=0;i<=nLab;i++){ const t=tMin+span*i/nLab; g.fillText(span>86400*1.5?fmtDT(t):fmtT(t), xOf(t), H-6); }
@@ -346,8 +356,11 @@ async function loadOverview(){
   const d=o.day||{}; const loss=d.loss??0;
   $('#t-loss').textContent = num(loss,2)+'%'; $('#t-loss').className='v '+(loss<0.5?'ok':loss<3?'warn':'bad');
   $('#t-loss-s').textContent = (d.outages||0)+' outage probe'+((d.outages||0)===1?'':'s')+' · max rtt '+num(d.rtt_max,0)+' ms';
-  if(o.throughput){ $('#t-tp').textContent = num(o.throughput.mbps,0)+' Mbps'; $('#t-tp').className='v acc';
-    $('#t-tp-s').textContent='measured '+ago(o.throughput.ts); } else { $('#t-tp').textContent='—'; $('#t-tp-s').textContent='first sample within 15 min'; }
+  if(o.throughput){ const mb=o.throughput.mbps, plan=o.plan_mbps; $('#t-tp').textContent = num(mb,0)+' Mbps';
+    const pct = plan ? Math.round(100*mb/plan) : null;
+    $('#t-tp').className='v '+(pct==null?'acc':pct>=85?'ok':pct>=60?'warn':'bad');
+    $('#t-tp-s').textContent = (pct!=null ? pct+'% of your '+num(plan,0)+' Mbps plan · ' : '')+'measured '+ago(o.throughput.ts); }
+  else { $('#t-tp').textContent='—'; $('#t-tp-s').textContent='first sample within 15 min'; }
   const m=o.machine, rt=o.router||{};
   // Line usage: prefer the router's WAN counters (whole house); fall back to this box's NIC.
   if(rt.wan_now){ $('#t-nic').textContent = num(rt.wan_now.rx_mbps,1)+' / '+num(rt.wan_now.tx_mbps,1);
@@ -431,6 +444,7 @@ async function loadDevices(){
   const rate = k => k==null ? '<span style="color:var(--muted)">—</span>' : k>=1000 ? num(k/1000,1)+' Mb' : num(k,0)+' kb';
   for(const x of recent){ const tr=document.createElement('tr');
     const nm = anonName(x);
+    if(x.mac){ tr.dataset.mac=x.mac; tr.dataset.label=nm||anonMac(x.mac); tr.className='clickable'; tr.title='click for 24h signal + rate'; }
     tr.innerHTML = '<td><span class="dot '+(x.online?'on':'')+'"></span></td>'+
       '<td>'+(nm||'<span style="color:var(--muted)">'+anonMac(x.mac)+'</span>')+'</td>'+
       '<td style="font-variant-numeric:tabular-nums">'+x.ip+'</td>'+
@@ -443,6 +457,7 @@ async function loadDevices(){
       '<td style="color:var(--dim)">'+ago(x.last_seen)+'</td>';
     tb.appendChild(tr); }
   if(!recent.length) tb.innerHTML='<tr><td colspan="10" class="empty">no devices</td></tr>';
+  reopenDetail('devices');
 }
 // Cudy reports signal as a positive dB figure (SNR-like): higher is better.
 function sig(db){ if(db==null) return '<span style="color:var(--muted)">—</span>';
@@ -454,6 +469,7 @@ async function loadWifi(){
   for(const c of cl){ const tr=document.createElement('tr');
     const dropsC = c.drops>=20?'bad':c.drops>=5?'warn':'';
     const nm = anonName(c);
+    tr.dataset.mac=c.mac; tr.dataset.label=nm||anonMac(c.mac); tr.className='clickable'; tr.title='click for 24h signal + drops';
     tr.innerHTML = '<td><span class="dot '+(c.online?'on':'')+'"></span></td>'+
       '<td>'+(nm||'<span style="color:var(--muted)">'+anonMac(c.mac)+'</span>')+(c.ip?' <span style="color:var(--muted);font-size:11px">'+c.ip+'</span>':'')+'</td>'+
       '<td style="color:var(--dim)">'+(c.band||'—')+'</td>'+
@@ -464,6 +480,7 @@ async function loadWifi(){
       '<td style="color:var(--dim)">'+(c.last_drop?ago(c.last_drop):'—')+'</td>';
     tb.appendChild(tr); }
   if(!cl.length) tb.innerHTML='<tr><td colspan="8" class="empty">no WiFi data yet — router syslog is ingested every 5 min</td></tr>';
+  reopenDetail('wifi');
 }
 async function loadServices(){
   const s = await j('/api/services'); const tb=$('#services tbody'); tb.innerHTML='';
@@ -487,6 +504,42 @@ async function loadServices(){
   if(!s.services.length) tb.innerHTML='<tr><td colspan="6" class="empty">no services configured</td></tr>';
 }
 const fmtDur = s => s<60 ? Math.round(s)+' s' : s<3600 ? Math.round(s/60)+' min' : Math.floor(s/3600)+'h '+Math.round((s%3600)/60)+'m';
+
+// ------------------------------------------------------ device drill-down ---
+// Click a device row (devices or WiFi table) to expand its 24h signal + rate + drops.
+let openDetail = null;   // {table, mac} — survives the 30s table rebuilds
+async function toggleDevice(tr, silent){
+  const next = tr.nextElementSibling;
+  const tableId = tr.closest('table').id;
+  if(next && next.classList.contains('detail')){ next.remove(); openDetail=null; return; }
+  tr.parentElement.querySelectorAll('tr.detail').forEach(e=>e.remove());
+  if(!silent) openDetail = {table: tableId, mac: tr.dataset.mac};
+  const cols = tr.children.length;
+  const det = document.createElement('tr'); det.className='detail';
+  det.innerHTML = '<td colspan="'+cols+'" style="padding:10px 8px 14px"><div class="dim" style="font-size:12px;color:var(--dim);margin-bottom:6px">'+
+    tr.dataset.label+' · last 24h · <span style="color:var(--acc)">signal dB</span> · <span style="color:var(--acc2)">download Mbps</span> · <span style="color:var(--bad)">disconnect (bar height = signal at drop)</span></div><canvas style="height:160px"></canvas></td>';
+  tr.after(det);
+  const cv = det.querySelector('canvas');
+  try{
+    const d = await j('/api/router/signal?mac='+encodeURIComponent(tr.dataset.mac)+'&hours=24');
+    if(!d.points.length && !d.drops.length){ det.querySelector('td').innerHTML='<div class="empty">no router data for this device (wired, or not seen by the router)</div>'; return; }
+    const now=Math.floor(Date.now()/1000);
+    const dmax = Math.max(1, ...d.points.map(p=>(p.down_kbps||0)/1000));
+    chart(cv, [
+      {pts:d.drops.map(p=>[p.ts, p.rssi||1]), color:css('--bad'), bars:true, interval:120},
+      {pts:d.points.map(p=>[p.ts, p.down_kbps==null?null:p.down_kbps/1000]), color:css('--acc2'), width:1, axis:'r'},
+      {pts:d.points.map(p=>[p.ts, p.signal_db]), color:css('--acc'), width:1.8, fill:true},
+    ], {tMin: d.since, tMax: now, lMax: 80, rightAxis:true, rMax: dmax*1.15, rUnit:''});
+  }catch(e){ det.querySelector('td').innerHTML='<div class="err">'+e.message+'</div>'; }
+}
+document.addEventListener('click', e=>{ const tr=e.target.closest('tr.clickable'); if(tr) toggleDevice(tr); });
+// Deep link: ?device=AA:BB:CC:DD:EE:FF opens that device's chart in the WiFi table on load.
+try{ const dm=new URLSearchParams(location.search).get('device'); if(dm) openDetail={table:'wifi', mac:dm.toUpperCase()}; }catch(e){}
+function reopenDetail(tableId){
+  if(!openDetail || openDetail.table!==tableId) return;
+  const tr=[...document.querySelectorAll('#'+tableId+' tr.clickable')].find(r=>r.dataset.mac===openDetail.mac);
+  if(tr) toggleDevice(tr, true);
+}
 async function loadIncidents(){
   const d = await j('/api/incidents?hours=168'); const tb=$('#incidents tbody'); tb.innerHTML='';
   const s=d.summary;
@@ -501,6 +554,22 @@ async function loadIncidents(){
       '<td style="color:var(--dim)">'+(i.services.length?i.services.join(', '):'—')+'</td>';
     tb.appendChild(tr); }
   if(!d.incidents.length) tb.innerHTML='<tr><td colspan="5" class="empty">nothing to report</td></tr>';
+}
+async function loadReport(){
+  const r = await j('/api/report?days=30'); const el=$('#report'); el.innerHTML='';
+  $('#rep-note').textContent = 'what your ISP actually delivered · based on '+r.covered_days+' day'+(r.covered_days===1?'':'s')+' of data';
+  const tile=(h,v,s,c='')=>{ const d=document.createElement('div'); d.className='tile';
+    d.style.cssText='background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px 12px';
+    d.innerHTML='<h2>'+h+'</h2><div class="v '+c+'" style="font-size:22px">'+v+'</div><div class="s">'+s+'</div>'; el.appendChild(d); };
+  const up=r.uptime_pct;
+  tile('Uptime', up==null?'—':up.toFixed(2)+'%', r.outages+' outage'+(r.outages===1?'':'s')+' · '+fmtDur(r.outage_s)+' total', up==null?'':up>=99.9?'ok':up>=99?'warn':'bad');
+  tile('Longest outage', r.longest_s?fmtDur(r.longest_s):'none', r.worst_outage_day?('worst day '+r.worst_outage_day.date+' · '+fmtDur(r.worst_outage_day.outage_s)):'—', r.longest_s>600?'bad':r.longest_s>120?'warn':'ok');
+  const sp=r.speed;
+  if(r.plan_mbps){ const p=r.pct_of_plan; tile('Delivered vs plan', p==null?'—':p+'%', 'avg '+num(sp.avg,1)+' of '+num(r.plan_mbps,0)+' Mbps · '+sp.samples+' tests', p==null?'':p>=85?'ok':p>=60?'warn':'bad'); }
+  else tile('Average speed', sp.avg==null?'—':num(sp.avg,1)+' Mbps', 'set PLAN_DOWN_MBPS to compare with your plan · '+sp.samples+' tests', 'acc');
+  tile('Slowest 10%', sp.p10==null?'—':num(sp.p10,1)+' Mbps', r.worst_speed_day?('worst day '+r.worst_speed_day.date+' · '+num(r.worst_speed_day.mbps,1)+' Mbps avg'):('min '+num(sp.min,1)+' · max '+num(sp.max,1)), sp.p10==null?'':(r.plan_mbps&&sp.p10<0.5*r.plan_mbps)?'bad':'');
+  tile('Packet loss', num(r.loss_avg,2)+'%', 'to 1.1.1.1 · max rtt '+num(r.rtt_max,0)+' ms', r.loss_avg<0.5?'ok':r.loss_avg<3?'warn':'bad');
+  tile('WiFi disconnects', r.wifi_drops.toLocaleString(), 'logged by the router', r.wifi_drops>200?'warn':'');
 }
 async function loadEvents(){
   const [ev, msg] = await Promise.all([j('/api/events?hours=168'), j('/api/pihole/messages')]);
@@ -517,7 +586,7 @@ async function loadEvents(){
 
 // -------------------------------------------------------------- refresh ---
 async function refresh(){
-  const tasks=[loadOverview(), loadServices(), loadWan(), loadThroughput(), loadMachine(), loadPihole(), loadDevices(), loadWifi(), loadIncidents(), loadEvents()];
+  const tasks=[loadOverview(), loadServices(), loadWan(), loadThroughput(), loadMachine(), loadPihole(), loadDevices(), loadWifi(), loadIncidents(), loadReport(), loadEvents()];
   const res = await Promise.allSettled(tasks);
   const failed = res.filter(r=>r.status==='rejected');
   if(failed.length){ console.warn(failed.map(f=>f.reason)); $('#updated').textContent += ' · '+failed.length+' panel(s) failed'; }

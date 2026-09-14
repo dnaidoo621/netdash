@@ -36,7 +36,13 @@ THROUGHPUT_INTERVAL = int(os.environ.get("THROUGHPUT_INTERVAL", "900"))
 THROUGHPUT_URL = os.environ.get(
     "THROUGHPUT_URL", "https://speed.cloudflare.com/__down?bytes=5000000"
 )
-RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "7"))
+# Raw samples are kept RAW_DAYS; hourly rollups are kept RETENTION_DAYS. Anything the
+# UI asks for beyond RAW_DAYS is served from the rollups.
+RAW_DAYS = int(os.environ.get("RAW_DAYS", "14"))
+RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "90"))
+MAX_HOURS = RETENTION_DAYS * 24
+# What you pay for. Set it and the throughput tile and monthly report say "x% of plan".
+PLAN_DOWN_MBPS = float(os.environ.get("PLAN_DOWN_MBPS", "0") or 0)
 ROUTER_URL = os.environ.get("ROUTER_URL", f"http://{GATEWAY}")
 ROUTER_PASSWORD = os.environ.get("ROUTER_PASSWORD", "")
 ROUTER_WAN_IFACE = os.environ.get("ROUTER_WAN_IFACE", "eth1.2")
@@ -144,6 +150,28 @@ CREATE INDEX IF NOT EXISTS ix_services ON services(name, ts);
 CREATE TABLE IF NOT EXISTS service_seen (
     name TEXT PRIMARY KEY, last_seen INTEGER NOT NULL, queries INTEGER
 );
+-- Hourly rollups. Column names match the raw tables where the UI reads them.
+CREATE TABLE IF NOT EXISTS probes_h (
+    ts INTEGER NOT NULL, target TEXT NOT NULL, n INTEGER,
+    loss REAL, loss_max REAL, rtt_avg REAL, rtt_max REAL, jitter REAL, outages INTEGER,
+    PRIMARY KEY (ts, target)
+);
+CREATE TABLE IF NOT EXISTS router_wan_h (
+    ts INTEGER PRIMARY KEY, rx_mbps REAL, rx_max REAL, tx_mbps REAL, tx_max REAL
+);
+CREATE TABLE IF NOT EXISTS machine_h (
+    ts INTEGER PRIMARY KEY, load1 REAL, pkg_temp REAL, temp_max REAL, fan INTEGER,
+    mem_avail_mb INTEGER, swap_free_mb INTEGER, rx_mbps REAL, tx_mbps REAL
+);
+CREATE TABLE IF NOT EXISTS services_h (
+    ts INTEGER NOT NULL, name TEXT NOT NULL, checks INTEGER, ok INTEGER, ttfb_ms REAL,
+    PRIMARY KEY (ts, name)
+);
+CREATE TABLE IF NOT EXISTS router_devices_h (
+    ts INTEGER NOT NULL, mac TEXT NOT NULL, sig_min INTEGER, sig_avg REAL, sig_max INTEGER,
+    down_avg REAL, down_max REAL, up_avg REAL, up_max REAL,
+    PRIMARY KEY (ts, mac)
+);
 """
 
 
@@ -166,12 +194,58 @@ def add_event(kind: str, detail: str):
         )
 
 
-def prune():
-    cutoff = int(time.time()) - RETENTION_DAYS * 86400
+def rollup(backfill: bool = False):
+    """Aggregate raw samples into hourly rows. Re-does the last 3 complete hours each run,
+    so late samples are folded in; INSERT OR REPLACE keeps it idempotent. backfill=True
+    (startup) covers every complete hour present in the raw tables."""
+    now = int(time.time())
+    end = now - now % 3600            # current, incomplete hour is excluded
+    start = end - 3 * 3600
+    if backfill:
+        with db() as conn:
+            r = conn.execute("SELECT MIN(ts) m FROM probes").fetchone()
+        start = (r["m"] // 3600) * 3600 if r and r["m"] else start
     with db() as conn:
-        for t in ("probes", "throughput", "machine", "events",
-                  "router_wan", "router_devices", "wifi_drops", "services"):
-            conn.execute(f"DELETE FROM {t} WHERE ts < ?", (cutoff,))
+        conn.execute("""
+            INSERT OR REPLACE INTO probes_h
+            SELECT (ts/3600)*3600, target, COUNT(*), AVG(loss), MAX(loss),
+                   AVG(rtt_avg), MAX(rtt_max), AVG(jitter), SUM(loss >= 100)
+            FROM probes WHERE ts >= ? AND ts < ? GROUP BY 1, 2""", (start, end))
+        conn.execute("""
+            INSERT OR REPLACE INTO router_wan_h
+            SELECT (ts/3600)*3600, AVG(rx_mbps), MAX(rx_mbps), AVG(tx_mbps), MAX(tx_mbps)
+            FROM router_wan WHERE ts >= ? AND ts < ? GROUP BY 1""", (start, end))
+        conn.execute("""
+            INSERT OR REPLACE INTO machine_h
+            SELECT (ts/3600)*3600, AVG(load1), AVG(pkg_temp), MAX(pkg_temp), AVG(fan),
+                   AVG(mem_avail_mb), AVG(swap_free_mb), AVG(rx_mbps), AVG(tx_mbps)
+            FROM machine WHERE ts >= ? AND ts < ? GROUP BY 1""", (start, end))
+        conn.execute("""
+            INSERT OR REPLACE INTO services_h
+            SELECT (ts/3600)*3600, name, COUNT(*), SUM(ok), AVG(ttfb_ms)
+            FROM services WHERE ts >= ? AND ts < ? GROUP BY 1, 2""", (start, end))
+        conn.execute("""
+            INSERT OR REPLACE INTO router_devices_h
+            SELECT (ts/3600)*3600, mac, MIN(signal_db), AVG(signal_db), MAX(signal_db),
+                   AVG(down_kbps), MAX(down_kbps), AVG(up_kbps), MAX(up_kbps)
+            FROM router_devices WHERE ts >= ? AND ts < ? GROUP BY 1, 2""", (start, end))
+
+
+def prune():
+    now = int(time.time())
+    raw_cut = now - RAW_DAYS * 86400
+    long_cut = now - RETENTION_DAYS * 86400
+    with db() as conn:
+        for t in ("probes", "machine", "router_wan", "router_devices", "services"):
+            conn.execute(f"DELETE FROM {t} WHERE ts < ?", (raw_cut,))
+        for t in ("throughput", "events", "wifi_drops", "probes_h", "router_wan_h",
+                  "machine_h", "services_h", "router_devices_h"):
+            conn.execute(f"DELETE FROM {t} WHERE ts < ?", (long_cut,))
+
+
+def raw_ok(hours: float) -> bool:
+    """Serve raw samples for short windows, hourly rollups for long ones."""
+    return hours <= RAW_DAYS * 24
 
 
 # ------------------------------------------------------------- collectors --
@@ -485,6 +559,10 @@ class Collector:
     async def loop(self):
         add_event("netdash_start", "Collector started")
         self.last_nic = (*read_nic_bytes(), time.time())
+        try:
+            rollup(backfill=True)
+        except Exception as e:
+            add_event("collector_error", f"rollup backfill: {e}"[:200])
         next_tp = 0.0
         next_syslog = 0.0
         next_svc = 0.0
@@ -509,6 +587,7 @@ class Collector:
                     asyncio.create_task(self.syslog_cycle())
                 if started >= next_prune:
                     next_prune = started + 3600
+                    rollup()
                     prune()
             except Exception as e:  # keep the loop alive no matter what
                 add_event("collector_error", str(e)[:200])
@@ -623,6 +702,7 @@ async def overview():
         "now": int(time.time()),
         "internet_up": internet_up,
         "verdict": v,
+        "plan_mbps": PLAN_DOWN_MBPS or None,
         "services": {"up": sum(1 for s in svcs if s["ok"]), "total": len(svcs),
                      "down": [s["name"] for s in svcs if s["down"]]},
         "latest": latest,
@@ -648,23 +728,33 @@ def services_summary(hours: float = 24, buckets: int = 48) -> list[dict]:
     now = int(time.time())
     s0 = now - int(hours * 3600)
     width = (now - s0) / buckets
-    data = rows("SELECT ts,name,ok,status,ttfb_ms,reason FROM services WHERE ts>? ORDER BY ts", s0)
-    by: dict[str, list] = {}
-    for r in data:
-        by.setdefault(r["name"], []).append(r)
+    # Strip + uptime come from raw or hourly depending on the window; "latest" and
+    # "last failure" always come from the raw table so they're current.
+    if raw_ok(hours):
+        hist = rows("SELECT ts,name,ok,1 AS checks FROM services WHERE ts>? ORDER BY ts", s0)
+    else:
+        hist = rows("SELECT ts,name,ok,checks FROM services_h WHERE ts>? ORDER BY ts", s0)
+    recent = rows("SELECT ts,name,ok,status,ttfb_ms,reason FROM services WHERE ts>? ORDER BY ts",
+                  since(24))
+    by_h: dict[str, list] = {}
+    for r in hist:
+        by_h.setdefault(r["name"], []).append(r)
+    by_r: dict[str, list] = {}
+    for r in recent:
+        by_r.setdefault(r["name"], []).append(r)
     out = []
     for svc in collector.services_active:
         name, url = svc["name"], svc["url"]
-        rs = by.get(name, [])
+        hs, rs = by_h.get(name, []), by_r.get(name, [])
         strip = [None] * buckets
-        agg = [[0, 0] for _ in range(buckets)]  # ok, total
-        for r in rs:
+        agg = [[0, 0] for _ in range(buckets)]  # ok, checks
+        for r in hs:
             i = min(buckets - 1, int((r["ts"] - s0) / width))
-            agg[i][0] += r["ok"]; agg[i][1] += 1
+            agg[i][0] += r["ok"]; agg[i][1] += r["checks"]
         for i, (ok, tot) in enumerate(agg):
             if tot:
                 strip[i] = 1.0 if ok == tot else (0.0 if ok == 0 else round(ok / tot, 2))
-        total = len(rs); up = sum(r["ok"] for r in rs)
+        total = sum(r["checks"] for r in hs); up = sum(r["ok"] for r in hs)
         latest = rs[-1] if rs else None
         prev = rs[-2] if len(rs) > 1 else None
         last_fail = next((r for r in reversed(rs) if not r["ok"]), None)
@@ -781,7 +871,7 @@ def verdict(internet_up: bool, inet_loss: float, gw_loss: float,
 
 
 @app.get("/api/services")
-async def services(hours: float = Query(24, ge=1, le=168)):
+async def services(hours: float = Query(24, ge=1, le=MAX_HOURS)):
     return {"now": int(time.time()), "hours": hours,
             "interval": SERVICE_INTERVAL, "services": services_summary(hours),
             "auto_detect": {"days": AUTO_DETECT_DAYS, "min_queries": AUTO_DETECT_MIN_QUERIES,
@@ -789,7 +879,7 @@ async def services(hours: float = Query(24, ge=1, le=168)):
 
 
 @app.get("/api/incidents")
-async def incidents(hours: float = Query(168, ge=1, le=336)):
+async def incidents(hours: float = Query(168, ge=1, le=MAX_HOURS)):
     inc = build_incidents(hours)
     total = sum(i["duration"] for i in inc)
     return {"now": int(time.time()), "hours": hours, "incidents": inc,
@@ -799,9 +889,9 @@ async def incidents(hours: float = Query(168, ge=1, le=336)):
 
 
 @app.get("/api/router/wan")
-async def router_wan(hours: float = Query(24, ge=1, le=168)):
-    return rows("SELECT ts,rx_mbps,tx_mbps FROM router_wan WHERE ts>? ORDER BY ts",
-                since(hours))
+async def router_wan(hours: float = Query(24, ge=1, le=MAX_HOURS)):
+    t = "router_wan" if raw_ok(hours) else "router_wan_h"
+    return rows(f"SELECT ts,rx_mbps,tx_mbps FROM {t} WHERE ts>? ORDER BY ts", since(hours))
 
 
 @app.get("/api/router/devices")
@@ -811,7 +901,7 @@ async def router_devices():
 
 
 @app.get("/api/router/wifi")
-async def router_wifi(hours: float = Query(24, ge=1, le=336)):
+async def router_wifi(hours: float = Query(24, ge=1, le=MAX_HOURS)):
     """Per-client WiFi stability: drops in window, current/worst signal."""
     s = since(hours)
     drops = rows("SELECT mac, COUNT(*) n, MIN(rssi) worst_drop_rssi, MAX(ts) last_drop "
@@ -845,31 +935,98 @@ async def router_wifi(hours: float = Query(24, ge=1, le=336)):
 
 
 @app.get("/api/router/signal")
-async def router_signal(mac: str, hours: float = Query(24, ge=1, le=168)):
-    return rows("SELECT ts, signal_db, down_kbps, up_kbps FROM router_devices "
-                "WHERE mac=? AND ts>? ORDER BY ts", mac.upper(), since(hours))
+async def router_signal(mac: str, hours: float = Query(24, ge=1, le=MAX_HOURS)):
+    """One device's story: signal and rate over time, plus the moments it dropped."""
+    mac = mac.upper()
+    s = since(hours)
+    if raw_ok(hours):
+        pts = rows("SELECT ts, signal_db, down_kbps, up_kbps FROM router_devices "
+                   "WHERE mac=? AND ts>? ORDER BY ts", mac, s)
+    else:
+        pts = rows("SELECT ts, sig_avg signal_db, down_avg down_kbps, up_avg up_kbps "
+                   "FROM router_devices_h WHERE mac=? AND ts>? ORDER BY ts", mac, s)
+    drops = rows("SELECT ts, rssi, radio FROM wifi_drops WHERE mac=? AND ts>? ORDER BY ts", mac, s)
+    return {"mac": mac, "since": s, "points": pts, "drops": drops}
+
 
 
 @app.get("/api/wan")
-async def wan(hours: float = Query(24, ge=1, le=168)):
-    return {"since": since(hours),
-            "probes": rows("SELECT ts,target,loss,rtt_avg,rtt_max,jitter "
-                           "FROM probes WHERE ts>? ORDER BY ts", since(hours))}
+async def wan(hours: float = Query(24, ge=1, le=MAX_HOURS)):
+    t = "probes" if raw_ok(hours) else "probes_h"
+    return {"since": since(hours), "source": t,
+            "probes": rows(f"SELECT ts,target,loss,rtt_avg,rtt_max,jitter "
+                           f"FROM {t} WHERE ts>? ORDER BY ts", since(hours))}
 
 
 @app.get("/api/throughput")
-async def throughput(hours: float = Query(24, ge=1, le=168)):
+async def throughput(hours: float = Query(24, ge=1, le=MAX_HOURS)):
     return rows("SELECT ts,mbps FROM throughput WHERE ts>? ORDER BY ts",
                 since(hours))
 
 
 @app.get("/api/machine")
-async def machine(hours: float = Query(24, ge=1, le=168)):
-    return rows("SELECT * FROM machine WHERE ts>? ORDER BY ts", since(hours))
+async def machine(hours: float = Query(24, ge=1, le=MAX_HOURS)):
+    t = "machine" if raw_ok(hours) else "machine_h"
+    return rows(f"SELECT ts,load1,pkg_temp,fan,mem_avail_mb,swap_free_mb,rx_mbps,tx_mbps "
+                f"FROM {t} WHERE ts>? ORDER BY ts", since(hours))
+
+
+@app.get("/api/report")
+async def report(days: int = Query(30, ge=1, le=RETENTION_DAYS)):
+    """The numbers you'd put in front of your ISP: uptime, outages, delivered vs plan."""
+    hours = days * 24
+    s = since(hours)
+    inc = build_incidents(hours)
+    now = int(time.time())
+    first = rows("SELECT MIN(ts) m FROM (SELECT MIN(ts) ts FROM probes UNION ALL "
+                 "SELECT MIN(ts) FROM probes_h)")[0]["m"]
+    cov_start = max(s, first or s)
+    covered_s = max(0, now - cov_start)
+    # The report covers only the window we were actually watching — the router's syslog
+    # can report outages from before netdash existed, and those would skew everything.
+    clipped = []
+    for i in inc:
+        a, b = max(i["start"], cov_start), min(i["end"] or now, now)
+        if b > a:
+            clipped.append({**i, "start": a, "end": b, "duration": b - a})
+    inc = clipped
+    outage_s = sum(i["duration"] for i in inc)
+    sp = rows("SELECT AVG(mbps) avg, MIN(mbps) min, MAX(mbps) max, COUNT(*) n "
+              "FROM throughput WHERE ts>?", s)[0]
+    p10 = rows("SELECT mbps FROM throughput WHERE ts>? ORDER BY mbps LIMIT 1 OFFSET "
+               "(SELECT COUNT(*)/10 FROM throughput WHERE ts>?)", s, s)
+    t = "probes" if raw_ok(hours) else "probes_h"
+    loss = rows(f"SELECT AVG(loss) l, MAX(rtt_avg) r FROM {t} WHERE target='internet' AND ts>?", s)[0]
+    # worst days
+    worst_speed = rows("SELECT date(ts,'unixepoch','localtime') d, AVG(mbps) m FROM throughput "
+                       "WHERE ts>? GROUP BY d ORDER BY m LIMIT 1", s)
+    by_day: dict[str, int] = {}
+    for i in inc:
+        d = time.strftime("%Y-%m-%d", time.localtime(i["start"]))
+        by_day[d] = by_day.get(d, 0) + i["duration"]
+    worst_outage = max(by_day.items(), key=lambda kv: kv[1], default=None)
+    drops = rows("SELECT COUNT(*) n FROM wifi_drops WHERE ts>?", s)[0]["n"]
+    avg = sp["avg"]
+    return {
+        "days": days, "covered_days": round(covered_s / 86400, 1),
+        "uptime_pct": round(100 * (1 - outage_s / covered_s), 3) if covered_s else None,
+        "outages": len(inc), "outage_s": outage_s,
+        "longest_s": max((i["duration"] for i in inc), default=0),
+        "speed": {"avg": round(avg, 1) if avg else None, "min": sp["min"], "max": sp["max"],
+                  "p10": p10[0]["mbps"] if p10 else None, "samples": sp["n"]},
+        "plan_mbps": PLAN_DOWN_MBPS or None,
+        "pct_of_plan": round(100 * avg / PLAN_DOWN_MBPS, 1) if (avg and PLAN_DOWN_MBPS) else None,
+        "loss_avg": round(loss["l"] or 0, 3), "rtt_max": loss["r"],
+        "wifi_drops": drops,
+        "worst_speed_day": ({"date": worst_speed[0]["d"], "mbps": round(worst_speed[0]["m"], 1)}
+                            if worst_speed else None),
+        "worst_outage_day": ({"date": worst_outage[0], "outage_s": worst_outage[1]}
+                             if worst_outage else None),
+    }
 
 
 @app.get("/api/events")
-async def events(hours: float = Query(72, ge=1, le=336)):
+async def events(hours: float = Query(72, ge=1, le=MAX_HOURS)):
     return rows("SELECT * FROM events WHERE ts>? ORDER BY ts DESC LIMIT 200",
                 since(hours))
 

@@ -8,7 +8,9 @@ Built for a low-power always-on box (in my case an old laptop running Pi-hole an
 
 ![Devices with per-client signal and rate, and the WiFi stability table](docs/devices.png)
 
-![Incidents — outages grouped with duration, cause, and a 7-day uptime summary](docs/incidents.png)
+![Click a device — its signal, download rate, and every disconnect over 24h](docs/drilldown.png)
+
+![Incidents grouped with duration and cause, and the 30-day report: uptime, delivered vs plan, packet loss](docs/report.png)
 
 <details>
 <summary>TV mode (1080p, sofa distance)</summary>
@@ -44,6 +46,12 @@ It's careful about blame: a service that fails while your own line is saturated 
 
 When the line is saturated the verdict names the device responsible: *"line saturated — 19 Mbps, that's all of it, Laptop 1 alone is pulling 15."*
 
+**Last 30 days** — the numbers for the ISP conversation: uptime %, outage count and longest, **delivered vs plan** (set `PLAN_DOWN_MBPS`), slowest-10% speed, worst day, packet loss, WiFi disconnects. It only counts the time it was actually watching (`based on N days of data`), so a fresh install doesn't report a fictional month.
+
+**Click any device** in the Devices or WiFi tables to expand its last 24h: signal strength, download rate, and each disconnect drawn as a red bar whose height is the signal at the moment it dropped. `?device=AA:BB:CC:DD:EE:FF` deep-links straight to one. This is how you answer *"was the phone on weak signal during that call?"*
+
+**History** — raw samples are kept 14 days; hourly rollups for 90. Every chart offers 6h / 24h / 7d / 30d / 90d and switches source automatically.
+
 **Charts** (6h / 24h / 7d)
 - WAN health: latency, jitter, and packet loss as thin red spikes, with a gateway line so you can tell LAN trouble from ISP trouble
 - Line usage and throughput: continuous WAN download/upload from the router plus periodic speed tests
@@ -66,7 +74,7 @@ When the line is saturated the verdict names the device responsible: *"line satu
 | Pi-hole v6 | REST API over loopback HTTP, proxied live (session cached, re-auth on 401) | on page load |
 | Cudy router | Stock-firmware web endpoints (see below) | 60s; syslog every 5 min |
 
-Everything time-series lands in `netdash.db` (SQLite) with 7-day retention.
+Everything time-series lands in `netdash.db` (SQLite): raw for 14 days, hourly rollups for 90 (`RAW_DAYS`, `RETENTION_DAYS`). Rollups are rebuilt for the last 3 hours every hour and backfilled on startup, so nothing is lost across restarts.
 
 ## Install
 
@@ -140,6 +148,8 @@ Everything the page uses is plain JSON, handy for `curl` when something looks wr
 | `/api/overview` | Headline state: **verdict**, internet up, latest probes, throughput, machine, Pi-hole summary, router summary, services up/down |
 | `/api/services?hours=24` | Per service: latest result, uptime %, 48-bucket strip, last failure and reason, `source` (auto / pinned) |
 | `/api/incidents?hours=168` | Outages grouped with duration, LAN-vs-ISP attribution, which sources saw it, services that failed during it; plus a summary |
+| `/api/report?days=30` | Uptime, outages, speed avg/p10/worst day, delivered vs plan, loss, WiFi drops — clipped to the time actually covered |
+| `/api/router/signal?mac=…&hours=24` | One device's signal + rate points and its disconnects |
 | `/api/wan?hours=24` | Probe timeseries (loss, rtt, jitter) per target |
 | `/api/throughput?hours=24` | Speed-test samples |
 | `/api/router/wan?hours=24` | Router WAN Mbps timeseries |
