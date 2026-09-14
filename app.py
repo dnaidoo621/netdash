@@ -46,34 +46,67 @@ SERVICE_INTERVAL = int(os.environ.get("SERVICE_INTERVAL", "120"))
 
 TARGETS = {"gateway": GATEWAY, "isp": ISP_BOX, "internet": INTERNET}
 
-# Services to health-check. Override with a services.json next to app.py:
-#   [{"name": "Netflix", "url": "https://www.netflix.com/"}, ...]
-DEFAULT_SERVICES = [
-    ("Netflix",   "https://www.netflix.com/"),
-    ("YouTube",   "https://www.youtube.com/"),
-    ("Google",    "https://www.google.com/generate_204"),
-    ("GitHub",    "https://github.com/"),
-    ("Apple",     "https://www.apple.com/"),
-    ("iCloud",    "https://www.icloud.com/"),
-    ("Microsoft", "https://www.microsoft.com/"),
-    ("WhatsApp",  "https://web.whatsapp.com/"),
-    ("Stremio",   "https://app.strem.io/"),
-    ("Claude",    "https://claude.ai/"),
+# Service catalog: (name, check URL, Pi-hole domain patterns). Which of these get
+# checked is decided automatically from what the house actually resolves — see
+# Collector.detect_services(). A services.json next to app.py pins extra entries
+# (or overrides a URL) and is always checked regardless of traffic.
+SERVICE_CATALOG = [
+    ("Netflix",     "https://www.netflix.com/",            ["netflix", "nflx"]),
+    ("YouTube",     "https://www.youtube.com/",            ["youtube", "googlevideo", "ytimg"]),
+    ("Google",      "https://www.google.com/generate_204", ["google.com", "gstatic", "googleapis"]),
+    ("GitHub",      "https://github.com/",                 ["github"]),
+    ("iCloud",      "https://www.icloud.com/",             ["icloud"]),
+    ("Apple",       "https://www.apple.com/",              ["apple.com", "apple-dns", "mzstatic"]),
+    ("Teams",       "https://teams.microsoft.com/",        ["teams.microsoft"]),
+    ("Microsoft",   "https://www.microsoft.com/",          ["microsoft", "msftconnecttest", "office.com", "live.com", "hotmail", "outlook"]),
+    ("WhatsApp",    "https://web.whatsapp.com/",           ["whatsapp"]),
+    ("Stremio",     "https://app.strem.io/",               ["strem.io", "strem.fun"]),
+    ("Claude",      "https://claude.ai/",                  ["claude.ai", "anthropic"]),
+    ("OpenAI",      "https://chatgpt.com/",                ["openai", "chatgpt"]),
+    ("Spotify",     "https://open.spotify.com/",           ["spotify", "scdn.co"]),
+    ("Prime Video", "https://www.primevideo.com/",         ["primevideo", "aiv-cdn", "amazonvideo"]),
+    ("Amazon",      "https://www.amazon.com/",             ["amazon.com", "amazon.co"]),
+    ("Disney+",     "https://www.disneyplus.com/",         ["disneyplus", "disney-plus", "bamgrid"]),
+    ("Showmax",     "https://www.showmax.com/",            ["showmax"]),
+    ("DStv",        "https://www.dstv.com/",               ["dstv", "multichoice"]),
+    ("Facebook",    "https://www.facebook.com/",           ["facebook", "fbcdn"]),
+    ("Instagram",   "https://www.instagram.com/",          ["instagram", "cdninstagram"]),
+    ("TikTok",      "https://www.tiktok.com/",             ["tiktok", "byteoversea"]),
+    ("X",           "https://x.com/",                      ["twitter", "twimg"]),
+    ("Reddit",      "https://www.reddit.com/",             ["reddit", "redd.it"]),
+    ("Twitch",      "https://www.twitch.tv/",              ["twitch", "ttvnw"]),
+    ("Slack",       "https://slack.com/",                  ["slack.com", "slack-edge"]),
+    ("Zoom",        "https://zoom.us/",                    ["zoom.us"]),
+    ("Discord",     "https://discord.com/",                ["discord"]),
+    ("Telegram",    "https://web.telegram.org/",           ["telegram"]),
+    ("Steam",       "https://store.steampowered.com/",     ["steampowered", "steamcontent", "steamstatic"]),
+    ("PlayStation", "https://www.playstation.com/",        ["playstation"]),
+    ("Xbox",        "https://www.xbox.com/",               ["xbox"]),
+    ("Plex",        "https://app.plex.tv/",                ["plex.tv"]),
+    ("Dropbox",     "https://www.dropbox.com/",            ["dropbox"]),
+    ("Tailscale",   "https://login.tailscale.com/",        ["tailscale"]),
+    ("Cloudflare",  "https://www.cloudflare.com/",         ["cloudflare"]),
 ]
+CATALOG_BY_NAME = {n: (u, p) for n, u, p in SERVICE_CATALOG}
+# Fallback when Pi-hole isn't available to tell us what's in use.
+DEFAULT_SERVICES = [(n, u) for n, u, _ in SERVICE_CATALOG[:11]]
+AUTO_DETECT_DAYS = int(os.environ.get("AUTO_DETECT_DAYS", "14"))
+AUTO_DETECT_MIN_QUERIES = int(os.environ.get("AUTO_DETECT_MIN_QUERIES", "25"))
 
 
-def load_services() -> list[tuple[str, str]]:
+def load_pinned() -> list[tuple[str, str]]:
     p = BASE / "services.json"
-    if p.exists():
-        try:
-            import json
-            return [(s["name"], s["url"]) for s in json.loads(p.read_text())]
-        except Exception:
-            pass
-    return DEFAULT_SERVICES
+    if not p.exists():
+        return []
+    try:
+        import json
+        return [(s["name"], s.get("url") or CATALOG_BY_NAME.get(s["name"], ("",))[0])
+                for s in json.loads(p.read_text())]
+    except Exception:
+        return []
 
 
-SERVICES = load_services()
+PINNED_SERVICES = load_pinned()
 
 # curl exit codes worth naming — everything else is reported by number.
 CURL_REASON = {6: "DNS failed", 7: "connection refused", 28: "timeout",
@@ -108,6 +141,9 @@ CREATE TABLE IF NOT EXISTS services (
     dns_ms REAL, connect_ms REAL, ttfb_ms REAL, reason TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_services ON services(name, ts);
+CREATE TABLE IF NOT EXISTS service_seen (
+    name TEXT PRIMARY KEY, last_seen INTEGER NOT NULL, queries INTEGER
+);
 """
 
 
@@ -266,6 +302,51 @@ class Collector:
         self.router_info: dict = {}
         self.router_info_ts = 0.0
         self.services_now: dict[str, dict] = {}
+        # [{"name","url","source":"pinned"|"auto","queries"}] — rebuilt by detect_services()
+        self.services_active: list[dict] = []
+
+    # ------------------------------------------------------ services --
+    def rebuild_services(self):
+        """pinned (always) + catalog entries the house has resolved recently."""
+        cutoff = int(time.time()) - AUTO_DETECT_DAYS * 86400
+        seen = {r["name"]: r for r in rows(
+            "SELECT name,last_seen,queries FROM service_seen WHERE last_seen>?", cutoff)}
+        active, have = [], set()
+        for name, url in PINNED_SERVICES:
+            active.append({"name": name, "url": url, "source": "pinned",
+                           "queries": seen.get(name, {}).get("queries")})
+            have.add(name)
+        for name, url, _ in SERVICE_CATALOG:      # catalog order = display order
+            if name in seen and name not in have:
+                active.append({"name": name, "url": url, "source": "auto",
+                               "queries": seen[name]["queries"]})
+                have.add(name)
+        if not active:                              # nothing known yet (or no Pi-hole)
+            active = [{"name": n, "url": u, "source": "default", "queries": None}
+                      for n, u in DEFAULT_SERVICES]
+        self.services_active = active
+
+    async def detect_services(self):
+        """Match Pi-hole's permitted domains against the catalog; remember what's in use."""
+        top = await pihole.safe("/api/stats/top_domains", {"blocked": "false", "count": 250})
+        domains = top.get("domains") if isinstance(top, dict) else None
+        if not domains:
+            self.rebuild_services()
+            return
+        ts = int(time.time())
+        hits = []
+        for name, _, patterns in SERVICE_CATALOG:
+            n = sum(d["count"] for d in domains
+                    if any(p in d["domain"].lower() for p in patterns))
+            if n >= AUTO_DETECT_MIN_QUERIES:
+                hits.append((name, ts, n))
+        if hits:
+            with db() as conn:
+                conn.executemany(
+                    "INSERT INTO service_seen(name,last_seen,queries) VALUES (?,?,?) "
+                    "ON CONFLICT(name) DO UPDATE SET last_seen=excluded.last_seen, "
+                    "queries=excluded.queries", hits)
+        self.rebuild_services()
 
     # ------------------------------------------------------- router --
     async def router_cycle(self):
@@ -305,7 +386,10 @@ class Collector:
 
     async def services_cycle(self):
         ts = int(time.time())
-        results = await asyncio.gather(*(check_service(n, u) for n, u in SERVICES))
+        if not self.services_active:
+            await self.detect_services()
+        results = await asyncio.gather(
+            *(check_service(s["name"], s["url"]) for s in self.services_active))
         with db() as conn:
             conn.executemany(
                 "INSERT INTO services VALUES (?,?,?,?,?,?,?,?)",
@@ -404,10 +488,14 @@ class Collector:
         next_tp = 0.0
         next_syslog = 0.0
         next_svc = 0.0
+        next_detect = 0.0
         next_prune = time.time() + 3600
         while True:
             started = time.time()
             try:
+                if started >= next_detect:
+                    next_detect = started + 3600
+                    await self.detect_services()
                 await asyncio.gather(self.probe_cycle(), self.machine_cycle(),
                                      self.router_cycle())
                 if started >= next_tp:
@@ -520,11 +608,17 @@ async def overview():
     gw = latest.get("gateway")
     wifi_weak = sum(1 for d in collector.router_devices_now
                     if d.get("signal_db") is not None and d["signal_db"] < 25)
+    hog = max(collector.router_devices_now, key=lambda d: d.get("down_kbps") or 0, default=None)
+    hog_mbps = (hog["down_kbps"] / 1000) if hog and hog.get("down_kbps") else None
     v = verdict(internet_up, inet["loss"] if inet else 0.0, gw["loss"] if gw else 0.0,
                 svcs, wifi_weak, "error" not in summary,
                 router.logged_in and not router.last_error,
                 line_used=rw[0]["rx_mbps"] if rw else None,
-                line_cap=tp[0]["mbps"] if tp else None)
+                line_cap=tp[0]["mbps"] if tp else None,
+                hog_mbps=hog_mbps)
+    if "{hog}" in v["text"] and hog:
+        v["hog"] = {"name": hog.get("name") or "", "mac": hog.get("mac"),
+                    "ip": hog.get("ip"), "mbps": round(hog_mbps or 0, 1)}
     return {
         "now": int(time.time()),
         "internet_up": internet_up,
@@ -555,11 +649,12 @@ def services_summary(hours: float = 24, buckets: int = 48) -> list[dict]:
     s0 = now - int(hours * 3600)
     width = (now - s0) / buckets
     data = rows("SELECT ts,name,ok,status,ttfb_ms,reason FROM services WHERE ts>? ORDER BY ts", s0)
-    by: dict[str, list] = {n: [] for n, _ in SERVICES}
+    by: dict[str, list] = {}
     for r in data:
         by.setdefault(r["name"], []).append(r)
     out = []
-    for name, url in SERVICES:
+    for svc in collector.services_active:
+        name, url = svc["name"], svc["url"]
         rs = by.get(name, [])
         strip = [None] * buckets
         agg = [[0, 0] for _ in range(buckets)]  # ok, total
@@ -575,6 +670,7 @@ def services_summary(hours: float = 24, buckets: int = 48) -> list[dict]:
         last_fail = next((r for r in reversed(rs) if not r["ok"]), None)
         out.append({
             "name": name, "url": url,
+            "source": svc["source"], "queries": svc.get("queries"),
             "ok": bool(latest and latest["ok"]),
             # "down" needs two consecutive failures so one blip doesn't shout
             "down": bool(latest and not latest["ok"] and (prev is None or not prev["ok"])),
@@ -590,10 +686,57 @@ def services_summary(hours: float = 24, buckets: int = 48) -> list[dict]:
     return out
 
 
+def build_incidents(hours: float) -> list[dict]:
+    """Group raw down/up events into outages with a duration, a cause, and collateral."""
+    ev = rows("SELECT ts,kind,detail FROM events WHERE ts>? AND kind IN "
+              "('internet_down','internet_up','wan_offline','wan_online') ORDER BY ts",
+              since(hours))
+    now = int(time.time())
+    windows, open_ = [], {}
+    for e in ev:
+        src = "netdash" if e["kind"].startswith("internet") else "router"
+        if e["kind"] in ("internet_down", "wan_offline"):
+            open_[src] = (e["ts"], e["detail"])
+        elif src in open_:
+            s, d = open_.pop(src)
+            windows.append({"start": s, "end": e["ts"], "src": src, "detail": d})
+    for src, (s, d) in open_.items():           # still down
+        windows.append({"start": s, "end": None, "src": src, "detail": d})
+    windows.sort(key=lambda w: w["start"])
+    # The probe and the router usually see the same outage; merge windows within 90s.
+    merged: list[dict] = []
+    for w in windows:
+        last = merged[-1] if merged else None
+        if last and w["start"] <= (last["end"] or now) + 90:
+            last["end"] = None if (last["end"] is None or w["end"] is None) else max(last["end"], w["end"])
+            last["sources"].add(w["src"])
+            if w["src"] == "netdash":
+                last["detail"] = w["detail"]
+        else:
+            merged.append({"start": w["start"], "end": w["end"], "sources": {w["src"]},
+                           "detail": w["detail"] if w["src"] == "netdash" else ""})
+    for m in merged:
+        end = m["end"] or now
+        m["duration"] = end - m["start"]
+        m["ongoing"] = m["end"] is None
+        d = m["detail"] or ""
+        m["where"] = ("LAN — gateway was unreachable" if "gateway unreachable" in d
+                      else "ISP — gateway was fine, line was out")
+        fails = rows("SELECT DISTINCT name FROM services WHERE ok=0 AND ts BETWEEN ? AND ?",
+                     m["start"] - 120, end + 120)
+        m["services"] = [f["name"] for f in fails]
+        m["sources"] = sorted(m["sources"])
+        del m["detail"]
+    merged.reverse()
+    return merged
+
+
 def verdict(internet_up: bool, inet_loss: float, gw_loss: float,
             svcs: list[dict], wifi_weak: int, pihole_ok: bool, router_ok: bool,
-            line_used: float | None = None, line_cap: float | None = None) -> dict:
-    """One sentence that says whose problem it is."""
+            line_used: float | None = None, line_cap: float | None = None,
+            hog_mbps: float | None = None) -> dict:
+    """One sentence that says whose problem it is. "{hog}" is filled in by the client so
+    demo mode can anonymise the device name."""
     if not internet_up:
         if gw_loss >= 100:
             return {"level": "bad", "text": "Internet down — the gateway isn't answering either; check the router and cable"}
@@ -610,7 +753,10 @@ def verdict(internet_up: bool, inet_loss: float, gw_loss: float,
         # Parallel flows can beat a single-stream speed test, so "used" may exceed "cap".
         how = (f"{line_used:.0f} Mbps, that's all of it" if line_used >= line_cap
                else f"{line_used:.0f} of {line_cap:.0f} Mbps in use")
-        parts.append(f"line saturated — {how}, anything else will buffer"); level = "warn"
+        # Name the device responsible if one is clearly pulling most of it.
+        who = (f", {{hog}} alone is pulling {hog_mbps:.0f}"
+               if hog_mbps and hog_mbps >= 0.5 * line_used else "")
+        parts.append(f"line saturated — {how}{who}; anything else will buffer"); level = "warn"
     if down:
         who = ", ".join(down)
         verb = "is" if len(down) == 1 else "are"
@@ -637,7 +783,19 @@ def verdict(internet_up: bool, inet_loss: float, gw_loss: float,
 @app.get("/api/services")
 async def services(hours: float = Query(24, ge=1, le=168)):
     return {"now": int(time.time()), "hours": hours,
-            "interval": SERVICE_INTERVAL, "services": services_summary(hours)}
+            "interval": SERVICE_INTERVAL, "services": services_summary(hours),
+            "auto_detect": {"days": AUTO_DETECT_DAYS, "min_queries": AUTO_DETECT_MIN_QUERIES,
+                            "catalog": len(SERVICE_CATALOG)}}
+
+
+@app.get("/api/incidents")
+async def incidents(hours: float = Query(168, ge=1, le=336)):
+    inc = build_incidents(hours)
+    total = sum(i["duration"] for i in inc)
+    return {"now": int(time.time()), "hours": hours, "incidents": inc,
+            "summary": {"count": len(inc), "total_s": total,
+                        "longest_s": max((i["duration"] for i in inc), default=0),
+                        "uptime_pct": round(100 * (1 - total / (hours * 3600)), 3)}}
 
 
 @app.get("/api/router/wan")

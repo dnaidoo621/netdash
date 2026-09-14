@@ -23,6 +23,9 @@
   .strip{display:flex;gap:2px;min-width:180px}
   .strip i{flex:1;height:14px;border-radius:2px;background:var(--panel2)}
   .strip i.ok{background:var(--ok)}.strip i.warn{background:var(--warn)}.strip i.bad{background:var(--bad)}
+  .tag{font-size:10px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;color:var(--muted);
+    border:1px solid var(--line);border-radius:4px;padding:1px 5px;margin-left:6px;vertical-align:middle}
+  .inc-ongoing{color:var(--bad);font-weight:600}
   .pill{margin-left:auto;padding:6px 14px;border-radius:999px;font-weight:700;font-size:13px;
     letter-spacing:.5px;background:var(--panel2);border:1px solid var(--line)}
   .pill.up{background:rgba(63,185,80,.15);color:var(--ok);border-color:rgba(63,185,80,.4)}
@@ -209,8 +212,16 @@
       </table></div>
     </div>
 
+    <div class="panel wide">
+      <h2>Incidents <span class="r" id="inc-note">outages grouped with duration and cause · last 7 days</span></h2>
+      <div class="scroll"><table id="incidents">
+        <thead><tr><th>When</th><th class="num">Duration</th><th>Where</th><th>Seen by</th><th>Services affected</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </div>
+
     <div class="panel">
-      <h2>Events <span class="r">outages · loss · router WAN · Pi-hole</span></h2>
+      <h2>Events <span class="r">raw feed · loss · router WAN · Pi-hole</span></h2>
       <ul class="list" id="events"></ul>
     </div>
 
@@ -320,7 +331,10 @@ async function loadOverview(){
   const up = o.internet_up, inet=o.latest.internet, gw=o.latest.gateway;
   const st=$('#status'); st.textContent = up?'INTERNET UP':'INTERNET DOWN'; st.className='pill '+(up?'up':'down');
   $('#updated').textContent = 'updated '+fmtTS(o.now)+' · auto-refresh every 30s · probing '+o.targets.internet+' every 60s';
-  const v=o.verdict||{}; const ve=$('#verdict'); ve.textContent=v.text||'—'; ve.className='verdict '+(v.level||''); ve.title=v.text||'';
+  const v=o.verdict||{}; let vt=v.text||'—';
+  if(v.hog){ const label = anonName({name:v.hog.name, mac:v.hog.mac, vendor:''}) || v.hog.name || (DEMO?MASK_MAC:v.hog.mac) || 'a device';
+    vt = vt.replace('{hog}', label); }
+  const ve=$('#verdict'); ve.textContent=vt; ve.className='verdict '+(v.level||''); ve.title=vt;
   const sv=o.services||{};
   if(sv.total){ const allUp = sv.up===sv.total;
     $('#t-svc').innerHTML = '<span class="'+(allUp?'ok':sv.down.length?'bad':'warn')+'">'+sv.up+'/'+sv.total+'</span>';
@@ -461,14 +475,32 @@ async function loadServices(){
     const issue = x.down ? '<span class="bad">'+x.reason+' · now</span>'
                 : x.last_fail ? '<span style="color:var(--dim)">'+x.last_fail_reason+' · '+ago(x.last_fail)+'</span>'
                 : '<span style="color:var(--muted)">none</span>';
+    const tag = x.source==='auto' ? ' <span class="tag" title="detected from Pi-hole traffic'+(x.queries?' · '+x.queries.toLocaleString()+' queries/24h':'')+'">auto</span>'
+              : x.source==='pinned' ? ' <span class="tag" title="pinned in services.json">pinned</span>' : '';
     tr.innerHTML = '<td><span class="dot '+dot+'" style="'+(dot==='bad'?'background:var(--bad);box-shadow:0 0 6px rgba(248,81,73,.6)':'')+'"></span></td>'+
-      '<td><b>'+x.name+'</b></td>'+
+      '<td><b>'+x.name+'</b>'+tag+'</td>'+
       '<td><div class="strip">'+strip+'</div></td>'+
       '<td class="num '+upC+'">'+(x.uptime==null?'—':num(x.uptime,x.uptime<99.95?1:0)+'%')+'</td>'+
       '<td class="num" style="color:var(--dim)">'+(x.ttfb_ms==null?'—':Math.round(x.ttfb_ms)+' ms')+'</td>'+
       '<td>'+issue+'</td>';
     tb.appendChild(tr); }
   if(!s.services.length) tb.innerHTML='<tr><td colspan="6" class="empty">no services configured</td></tr>';
+}
+const fmtDur = s => s<60 ? Math.round(s)+' s' : s<3600 ? Math.round(s/60)+' min' : Math.floor(s/3600)+'h '+Math.round((s%3600)/60)+'m';
+async function loadIncidents(){
+  const d = await j('/api/incidents?hours=168'); const tb=$('#incidents tbody'); tb.innerHTML='';
+  const s=d.summary;
+  $('#inc-note').textContent = s.count ? s.count+' outage'+(s.count===1?'':'s')+' in 7 days · '+fmtDur(s.total_s)+' total · longest '+fmtDur(s.longest_s)+' · '+s.uptime_pct.toFixed(2)+'% uptime'
+                                       : 'no outages in the last 7 days';
+  for(const i of d.incidents){ const tr=document.createElement('tr');
+    const when = fmtDT(i.start)+(i.ongoing?'':' – '+fmtT(i.end));
+    tr.innerHTML = '<td style="white-space:nowrap">'+when+'</td>'+
+      '<td class="num '+(i.ongoing?'inc-ongoing':'')+'">'+(i.ongoing?'ongoing · ':'')+fmtDur(i.duration)+'</td>'+
+      '<td>'+i.where+'</td>'+
+      '<td style="color:var(--dim)">'+i.sources.join(' + ')+'</td>'+
+      '<td style="color:var(--dim)">'+(i.services.length?i.services.join(', '):'—')+'</td>';
+    tb.appendChild(tr); }
+  if(!d.incidents.length) tb.innerHTML='<tr><td colspan="5" class="empty">nothing to report</td></tr>';
 }
 async function loadEvents(){
   const [ev, msg] = await Promise.all([j('/api/events?hours=168'), j('/api/pihole/messages')]);
@@ -485,7 +517,7 @@ async function loadEvents(){
 
 // -------------------------------------------------------------- refresh ---
 async function refresh(){
-  const tasks=[loadOverview(), loadServices(), loadWan(), loadThroughput(), loadMachine(), loadPihole(), loadDevices(), loadWifi(), loadEvents()];
+  const tasks=[loadOverview(), loadServices(), loadWan(), loadThroughput(), loadMachine(), loadPihole(), loadDevices(), loadWifi(), loadIncidents(), loadEvents()];
   const res = await Promise.allSettled(tasks);
   const failed = res.filter(r=>r.status==='rejected');
   if(failed.length){ console.warn(failed.map(f=>f.reason)); $('#updated').textContent += ' · '+failed.length+' panel(s) failed'; }

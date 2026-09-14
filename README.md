@@ -32,7 +32,15 @@ It's careful about blame: a service that fails while your own line is saturated 
 - Line usage right now — whole house, from the router's WAN counters
 - Pi-hole block rate, router status, **services up (n/n)**, host machine temperature / load / fan
 
-**Service status** — the classic status-page strip for the services you actually use (Netflix, YouTube, GitHub… configurable). Every 2 minutes each one gets an HTTP check with the timing split by phase — DNS → TCP → TLS → first byte — so a failure says *where* it failed. 24h uptime %, current response time, last issue. Any HTTP answer below 500 counts as reachable (bot-protection 403s are still "up").
+**Service status** — the classic status-page strip for the services your house actually uses. **The list maintains itself**: a catalog of ~35 known services is cross-referenced against Pi-hole's permitted domains every hour, and anything the house has resolved recently gets checked. Start watching TikTok, it appears; stop using Stremio for a fortnight, it drops off. Every 2 minutes each service gets an HTTP check with the timing split by phase — DNS → TCP → TLS → first byte — so a failure says *where* it failed. 24h uptime %, current response time, last issue. Any HTTP answer below 500 counts as reachable (bot-protection 403s are still "up").
+
+**Incidents** — the raw down/up events grouped into outages with a duration and a cause, the probe's view and the router's merged into one row:
+
+> Sep 14 01:49 PM – 01:59 PM · 10 min · ISP — gateway was fine, line was out · seen by router
+
+…plus a 7-day summary: count, total minutes, longest, uptime %. That's the table you put in front of your ISP.
+
+When the line is saturated the verdict names the device responsible: *"line saturated — 19 Mbps, that's all of it, Laptop 1 alone is pulling 15."*
 
 **Charts** (6h / 24h / 7d)
 - WAN health: latency, jitter, and packet loss as thin red spikes, with a gateway line so you can tell LAN trouble from ISP trouble
@@ -53,7 +61,7 @@ It's careful about blame: a service that fails while your own line is saturated 
 | Throughput | 5 MB download from Cloudflare — **skipped if the line is already busy**, so it never fights a stream or misreports | 15 min |
 | Host machine | `/proc`, thermal zones, `sensors`, NIC byte deltas | 60s |
 | Services | `curl` per service with `%{time_namelookup}`/`connect`/`starttransfer` and `%{exitcode}` | 2 min |
-| Pi-hole v6 | REST API, proxied live (session cached, re-auth on 401) | on page load |
+| Pi-hole v6 | REST API over loopback HTTP, proxied live (session cached, re-auth on 401) | on page load |
 | Cudy router | Stock-firmware web endpoints (see below) | 60s; syslog every 5 min |
 
 Everything time-series lands in `netdash.db` (SQLite) with 7-day retention.
@@ -83,7 +91,9 @@ Requirements on the host: `ping` (unprivileged ICMP — default on Ubuntu), `cur
 
 ### Choosing which services to watch
 
-Copy `services.json.example` to `services.json` and edit. Pick endpoints that answer plainly — `https://www.google.com/generate_204` is ideal; a marketing homepage that 302s three times is fine too since checks follow redirects. Restart the service after changing it.
+You mostly don't. The catalog in `app.py` (`SERVICE_CATALOG`) maps domain patterns to services, and detection picks whichever ones Pi-hole has seen ≥25 queries for in the last 24h, keeping them for 14 days after they were last seen (`AUTO_DETECT_MIN_QUERIES`, `AUTO_DETECT_DAYS`). Detected entries are tagged **auto** in the panel.
+
+To force a service regardless of traffic, or to override a check URL, copy `services.json.example` to `services.json` — those are tagged **pinned**. Pick endpoints that answer plainly: `https://www.google.com/generate_204` is ideal; a homepage that 302s a few times is fine since checks follow redirects. Without Pi-hole, the first eleven catalog entries are used. Restart the service after changing it.
 
 ### TV mode
 
@@ -126,7 +136,8 @@ Everything the page uses is plain JSON, handy for `curl` when something looks wr
 | Endpoint | Returns |
 |---|---|
 | `/api/overview` | Headline state: **verdict**, internet up, latest probes, throughput, machine, Pi-hole summary, router summary, services up/down |
-| `/api/services?hours=24` | Per service: latest result, uptime %, 48-bucket strip, last failure and reason |
+| `/api/services?hours=24` | Per service: latest result, uptime %, 48-bucket strip, last failure and reason, `source` (auto / pinned) |
+| `/api/incidents?hours=168` | Outages grouped with duration, LAN-vs-ISP attribution, which sources saw it, services that failed during it; plus a summary |
 | `/api/wan?hours=24` | Probe timeseries (loss, rtt, jitter) per target |
 | `/api/throughput?hours=24` | Speed-test samples |
 | `/api/router/wan?hours=24` | Router WAN Mbps timeseries |
