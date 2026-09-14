@@ -18,11 +18,21 @@ Built for a low-power always-on box (in my case an old laptop running Pi-hole an
 
 ## What it shows
 
+**The verdict** — one sentence in the header that says whose problem it is, synthesised from everything below:
+
+> *Netflix is down — your line is fine, that's on them*
+> *line saturated — 17 of 18 Mbps in use, anything else will buffer*
+> *Internet down — your router is fine, the line to the ISP is out*
+
+It's careful about blame: a service that fails while your own line is saturated or lossy is reported as *"probably the saturated line, not them."*
+
 **Top row — the glance**
 - Internet status pill (turns red and pulses on outage)
 - Latency + jitter, 24h packet loss, last speed test
 - Line usage right now — whole house, from the router's WAN counters
-- Pi-hole block rate, router status, host machine temperature / load / fan
+- Pi-hole block rate, router status, **services up (n/n)**, host machine temperature / load / fan
+
+**Service status** — the classic status-page strip for the services you actually use (Netflix, YouTube, GitHub… configurable). Every 2 minutes each one gets an HTTP check with the timing split by phase — DNS → TCP → TLS → first byte — so a failure says *where* it failed. 24h uptime %, current response time, last issue. Any HTTP answer below 500 counts as reachable (bot-protection 403s are still "up").
 
 **Charts** (6h / 24h / 7d)
 - WAN health: latency, jitter, and packet loss as thin red spikes, with a gateway line so you can tell LAN trouble from ISP trouble
@@ -42,6 +52,7 @@ Built for a low-power always-on box (in my case an old laptop running Pi-hole an
 | WAN health | `ping -c10 -i0.2` to gateway, ISP box, and `1.1.1.1` | 60s |
 | Throughput | 5 MB download from Cloudflare — **skipped if the line is already busy**, so it never fights a stream or misreports | 15 min |
 | Host machine | `/proc`, thermal zones, `sensors`, NIC byte deltas | 60s |
+| Services | `curl` per service with `%{time_namelookup}`/`connect`/`starttransfer` and `%{exitcode}` | 2 min |
 | Pi-hole v6 | REST API, proxied live (session cached, re-auth on 401) | on page load |
 | Cudy router | Stock-firmware web endpoints (see below) | 60s; syslog every 5 min |
 
@@ -68,7 +79,11 @@ sudo systemctl enable --now netdash
 
 Then open `http://<host>:8080`. Edit `netdash.service` if your user isn't `darren` or you want a different port.
 
-Requirements on the host: `ping` (unprivileged ICMP — default on Ubuntu), `curl`, and `lm-sensors` for the fan reading (optional; shows `?` without it).
+Requirements on the host: `ping` (unprivileged ICMP — default on Ubuntu), `curl` ≥ 7.75 (for `%{exitcode}`), and `lm-sensors` for the fan reading (optional; shows `?` without it).
+
+### Choosing which services to watch
+
+Copy `services.json.example` to `services.json` and edit. Pick endpoints that answer plainly — `https://www.google.com/generate_204` is ideal; a marketing homepage that 302s three times is fine too since checks follow redirects. Restart the service after changing it.
 
 ### TV mode
 
@@ -110,7 +125,8 @@ Everything the page uses is plain JSON, handy for `curl` when something looks wr
 
 | Endpoint | Returns |
 |---|---|
-| `/api/overview` | Headline state: internet up, latest probes, throughput, machine, Pi-hole summary, router summary |
+| `/api/overview` | Headline state: **verdict**, internet up, latest probes, throughput, machine, Pi-hole summary, router summary, services up/down |
+| `/api/services?hours=24` | Per service: latest result, uptime %, 48-bucket strip, last failure and reason |
 | `/api/wan?hours=24` | Probe timeseries (loss, rtt, jitter) per target |
 | `/api/throughput?hours=24` | Speed-test samples |
 | `/api/router/wan?hours=24` | Router WAN Mbps timeseries |
@@ -135,5 +151,6 @@ router.py           Cudy stock-firmware client
 static/index.html   the whole UI — vanilla JS, canvas charts, no dependencies
 netdash.service     systemd unit
 config.env.example  configuration template
+services.json.example  which services to health-check
 tools/              the probes used to reverse-engineer the Cudy endpoints
 ```

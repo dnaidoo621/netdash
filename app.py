@@ -42,7 +42,42 @@ ROUTER_PASSWORD = os.environ.get("ROUTER_PASSWORD", "")
 ROUTER_WAN_IFACE = os.environ.get("ROUTER_WAN_IFACE", "eth1.2")
 SYSLOG_INTERVAL = int(os.environ.get("SYSLOG_INTERVAL", "300"))
 
+SERVICE_INTERVAL = int(os.environ.get("SERVICE_INTERVAL", "120"))
+
 TARGETS = {"gateway": GATEWAY, "isp": ISP_BOX, "internet": INTERNET}
+
+# Services to health-check. Override with a services.json next to app.py:
+#   [{"name": "Netflix", "url": "https://www.netflix.com/"}, ...]
+DEFAULT_SERVICES = [
+    ("Netflix",   "https://www.netflix.com/"),
+    ("YouTube",   "https://www.youtube.com/"),
+    ("Google",    "https://www.google.com/generate_204"),
+    ("GitHub",    "https://github.com/"),
+    ("Apple",     "https://www.apple.com/"),
+    ("iCloud",    "https://www.icloud.com/"),
+    ("Microsoft", "https://www.microsoft.com/"),
+    ("WhatsApp",  "https://web.whatsapp.com/"),
+    ("Stremio",   "https://app.strem.io/"),
+    ("Claude",    "https://claude.ai/"),
+]
+
+
+def load_services() -> list[tuple[str, str]]:
+    p = BASE / "services.json"
+    if p.exists():
+        try:
+            import json
+            return [(s["name"], s["url"]) for s in json.loads(p.read_text())]
+        except Exception:
+            pass
+    return DEFAULT_SERVICES
+
+
+SERVICES = load_services()
+
+# curl exit codes worth naming — everything else is reported by number.
+CURL_REASON = {6: "DNS failed", 7: "connection refused", 28: "timeout",
+               35: "TLS handshake failed", 56: "connection reset", 60: "bad certificate"}
 
 # ---------------------------------------------------------------- storage --
 
@@ -68,6 +103,11 @@ CREATE TABLE IF NOT EXISTS router_devices (
 CREATE INDEX IF NOT EXISTS ix_rdev ON router_devices(mac, ts);
 CREATE TABLE IF NOT EXISTS wifi_drops (ts INTEGER NOT NULL, mac TEXT, radio TEXT, rssi INTEGER);
 CREATE INDEX IF NOT EXISTS ix_wdrops ON wifi_drops(ts);
+CREATE TABLE IF NOT EXISTS services (
+    ts INTEGER NOT NULL, name TEXT NOT NULL, ok INTEGER, status INTEGER,
+    dns_ms REAL, connect_ms REAL, ttfb_ms REAL, reason TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_services ON services(name, ts);
 """
 
 
@@ -94,7 +134,7 @@ def prune():
     cutoff = int(time.time()) - RETENTION_DAYS * 86400
     with db() as conn:
         for t in ("probes", "throughput", "machine", "events",
-                  "router_wan", "router_devices", "wifi_drops"):
+                  "router_wan", "router_devices", "wifi_drops", "services"):
             conn.execute(f"DELETE FROM {t} WHERE ts < ?", (cutoff,))
 
 
@@ -149,6 +189,37 @@ async def throughput_mbps() -> float | None:
     return round(bps * 8 / 1_000_000, 1) if bps > 0 else None
 
 
+async def check_service(name: str, url: str) -> dict:
+    """One HTTP check with the timing split by phase, so a failure says *where* it failed."""
+    out = await run(
+        ["curl", "-o", "/dev/null", "-s", "-L", "--max-time", "12", "-A", "netdash/1.0",
+         "-w", "%{http_code} %{time_namelookup} %{time_connect} %{time_starttransfer} %{exitcode}",
+         url],
+        timeout=15,
+    )
+    parts = out.strip().split()
+    row = {"name": name, "ok": 0, "status": 0, "dns_ms": None, "connect_ms": None,
+           "ttfb_ms": None, "reason": "timeout"}
+    if len(parts) < 5:
+        return row
+    try:
+        status = int(parts[0]); exitcode = int(parts[4])
+        dns, conn, ttfb = (float(parts[i]) * 1000 for i in (1, 2, 3))
+    except ValueError:
+        return row
+    row.update(status=status, dns_ms=round(dns, 1), connect_ms=round(conn, 1),
+               ttfb_ms=round(ttfb, 1))
+    if exitcode:
+        row["reason"] = CURL_REASON.get(exitcode, f"curl error {exitcode}")
+    elif status >= 500:
+        row["reason"] = f"HTTP {status}"
+    else:
+        # Any real answer below 500 means the service is reachable. Sites like claude.ai
+        # hand curl a 403 from bot protection — that's still "up" for our purposes.
+        row["ok"], row["reason"] = 1, ""
+    return row
+
+
 def read_pkg_temp() -> float | None:
     for z in Path("/sys/class/thermal").glob("thermal_zone*"):
         try:
@@ -194,6 +265,7 @@ class Collector:
         self.router_devices_now: list[dict] = []
         self.router_info: dict = {}
         self.router_info_ts = 0.0
+        self.services_now: dict[str, dict] = {}
 
     # ------------------------------------------------------- router --
     async def router_cycle(self):
@@ -230,6 +302,16 @@ class Collector:
                 self.router_info = {"wan": wan, "system": sysinfo, "mesh": mesh,
                                     "fetched": ts}
                 self.router_info_ts = time.time()
+
+    async def services_cycle(self):
+        ts = int(time.time())
+        results = await asyncio.gather(*(check_service(n, u) for n, u in SERVICES))
+        with db() as conn:
+            conn.executemany(
+                "INSERT INTO services VALUES (?,?,?,?,?,?,?,?)",
+                [(ts, r["name"], r["ok"], r["status"], r["dns_ms"], r["connect_ms"],
+                  r["ttfb_ms"], r["reason"]) for r in results])
+        self.services_now = {r["name"]: r for r in results}
 
     async def syslog_cycle(self):
         if not ROUTER_PASSWORD:
@@ -321,6 +403,7 @@ class Collector:
         self.last_nic = (*read_nic_bytes(), time.time())
         next_tp = 0.0
         next_syslog = 0.0
+        next_svc = 0.0
         next_prune = time.time() + 3600
         while True:
             started = time.time()
@@ -330,6 +413,9 @@ class Collector:
                 if started >= next_tp:
                     next_tp = started + THROUGHPUT_INTERVAL
                     asyncio.create_task(self.throughput_cycle())
+                if started >= next_svc:
+                    next_svc = started + SERVICE_INTERVAL
+                    asyncio.create_task(self.services_cycle())
                 if started >= next_syslog:
                     next_syslog = started + SYSLOG_INTERVAL
                     asyncio.create_task(self.syslog_cycle())
@@ -429,9 +515,22 @@ async def overview():
     rw = rows("SELECT * FROM router_wan ORDER BY ts DESC LIMIT 1")
     rday = rows("SELECT MAX(rx_mbps) peak_down, MAX(tx_mbps) peak_up, AVG(rx_mbps) avg_down "
                 "FROM router_wan WHERE ts>?", since(24))
+    svcs = services_summary(24)
+    internet_up = bool(inet and inet["loss"] < 100)
+    gw = latest.get("gateway")
+    wifi_weak = sum(1 for d in collector.router_devices_now
+                    if d.get("signal_db") is not None and d["signal_db"] < 25)
+    v = verdict(internet_up, inet["loss"] if inet else 0.0, gw["loss"] if gw else 0.0,
+                svcs, wifi_weak, "error" not in summary,
+                router.logged_in and not router.last_error,
+                line_used=rw[0]["rx_mbps"] if rw else None,
+                line_cap=tp[0]["mbps"] if tp else None)
     return {
         "now": int(time.time()),
-        "internet_up": bool(inet and inet["loss"] < 100),
+        "internet_up": internet_up,
+        "verdict": v,
+        "services": {"up": sum(1 for s in svcs if s["ok"]), "total": len(svcs),
+                     "down": [s["name"] for s in svcs if s["down"]]},
         "latest": latest,
         "throughput": tp[0] if tp else None,
         "machine": mc[0] if mc else None,
@@ -448,6 +547,97 @@ async def overview():
             **collector.router_info,
         },
     }
+
+
+def services_summary(hours: float = 24, buckets: int = 48) -> list[dict]:
+    """Per service: latest result, uptime %, and a status-page strip of N time buckets."""
+    now = int(time.time())
+    s0 = now - int(hours * 3600)
+    width = (now - s0) / buckets
+    data = rows("SELECT ts,name,ok,status,ttfb_ms,reason FROM services WHERE ts>? ORDER BY ts", s0)
+    by: dict[str, list] = {n: [] for n, _ in SERVICES}
+    for r in data:
+        by.setdefault(r["name"], []).append(r)
+    out = []
+    for name, url in SERVICES:
+        rs = by.get(name, [])
+        strip = [None] * buckets
+        agg = [[0, 0] for _ in range(buckets)]  # ok, total
+        for r in rs:
+            i = min(buckets - 1, int((r["ts"] - s0) / width))
+            agg[i][0] += r["ok"]; agg[i][1] += 1
+        for i, (ok, tot) in enumerate(agg):
+            if tot:
+                strip[i] = 1.0 if ok == tot else (0.0 if ok == 0 else round(ok / tot, 2))
+        total = len(rs); up = sum(r["ok"] for r in rs)
+        latest = rs[-1] if rs else None
+        prev = rs[-2] if len(rs) > 1 else None
+        last_fail = next((r for r in reversed(rs) if not r["ok"]), None)
+        out.append({
+            "name": name, "url": url,
+            "ok": bool(latest and latest["ok"]),
+            # "down" needs two consecutive failures so one blip doesn't shout
+            "down": bool(latest and not latest["ok"] and (prev is None or not prev["ok"])),
+            "status": latest["status"] if latest else None,
+            "ttfb_ms": latest["ttfb_ms"] if latest else None,
+            "reason": latest["reason"] if latest else "",
+            "uptime": round(100 * up / total, 2) if total else None,
+            "checks": total,
+            "last_fail": last_fail["ts"] if last_fail else None,
+            "last_fail_reason": last_fail["reason"] if last_fail else "",
+            "strip": strip,
+        })
+    return out
+
+
+def verdict(internet_up: bool, inet_loss: float, gw_loss: float,
+            svcs: list[dict], wifi_weak: int, pihole_ok: bool, router_ok: bool,
+            line_used: float | None = None, line_cap: float | None = None) -> dict:
+    """One sentence that says whose problem it is."""
+    if not internet_up:
+        if gw_loss >= 100:
+            return {"level": "bad", "text": "Internet down — the gateway isn't answering either; check the router and cable"}
+        return {"level": "bad", "text": "Internet down — your router is fine, the line to the ISP is out"}
+    parts, level = [], "ok"
+    down = [s["name"] for s in svcs if s["down"]]
+    lossy = inet_loss >= 5
+    # 80%, not higher: the WAN figure is a 60s average that includes ramp-up, so a line
+    # that is effectively full reads 80–90%. Verified against a forced 17 Mbps download.
+    saturated = bool(line_used is not None and line_cap and line_used >= 0.80 * line_cap)
+    if lossy:
+        parts.append(f"{inet_loss:.0f}% packet loss on the line"); level = "warn"
+    if saturated:
+        # Parallel flows can beat a single-stream speed test, so "used" may exceed "cap".
+        how = (f"{line_used:.0f} Mbps, that's all of it" if line_used >= line_cap
+               else f"{line_used:.0f} of {line_cap:.0f} Mbps in use")
+        parts.append(f"line saturated — {how}, anything else will buffer"); level = "warn"
+    if down:
+        who = ", ".join(down)
+        verb = "is" if len(down) == 1 else "are"
+        # Only blame the service when our own line is clean. A saturated or lossy line
+        # starves the checks too, and that's on us.
+        if saturated:
+            parts.append(f"{who} {verb} unreachable — probably the saturated line, not them")
+        elif lossy:
+            parts.append(f"{who} {verb} unreachable — probably the packet loss, not them")
+        else:
+            parts.append(f"{who} {verb} down — your line is fine, that's on them")
+        level = "warn"
+    if wifi_weak:
+        parts.append(f"{wifi_weak} WiFi client{'s' if wifi_weak > 1 else ''} on weak signal"); level = "warn"
+    if not pihole_ok:
+        parts.append("Pi-hole API unreachable"); level = "warn"
+    if ROUTER_PASSWORD and not router_ok:
+        parts.append("router not reachable"); level = "warn"
+    if not parts:
+        return {"level": "ok", "text": "Everything looks healthy"}
+    return {"level": level, "text": " · ".join(parts)}
+
+
+@app.get("/api/services")
+async def services(hours: float = Query(24, ge=1, le=168)):
+    return {"now": int(time.time()), "hours": hours,
+            "interval": SERVICE_INTERVAL, "services": services_summary(hours)}
 
 
 @app.get("/api/router/wan")

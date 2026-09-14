@@ -1,0 +1,12 @@
+[
+  {"name": "Netflix",   "url": "https://www.netflix.com/"},
+  {"name": "YouTube",   "url": "https://www.youtube.com/"},
+  {"name": "Google",    "url": "https://www.google.com/generate_204"},
+  {"name": "GitHub",    "url": "https://github.com/"},
+  {"name": "Apple",     "url": "https://www.apple.com/"},
+  {"name": "iCloud",    "url": "https://www.icloud.com/"},
+  {"name": "Microsoft", "url": "https://www.microsoft.com/"},
+  {"name": "WhatsApp",  "url": "https://web.whatsapp.com/"},
+  {"name": "Stremio",   "url": "https://app.strem.io/"},
+  {"name": "Claude",    "url": "https://claude.ai/"}
+]

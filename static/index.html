@@ -18,6 +18,11 @@
     border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5}
   header h1{margin:0;font-size:18px;font-weight:600;letter-spacing:.3px}
   header .sub{color:var(--dim);font-size:12px}
+  header .verdict{font-size:13px;font-weight:600;margin:2px 0 1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  header .verdict.ok{color:var(--ok)}header .verdict.warn{color:var(--warn)}header .verdict.bad{color:var(--bad)}
+  .strip{display:flex;gap:2px;min-width:180px}
+  .strip i{flex:1;height:14px;border-radius:2px;background:var(--panel2)}
+  .strip i.ok{background:var(--ok)}.strip i.warn{background:var(--warn)}.strip i.bad{background:var(--bad)}
   .pill{margin-left:auto;padding:6px 14px;border-radius:999px;font-weight:700;font-size:13px;
     letter-spacing:.5px;background:var(--panel2);border:1px solid var(--line)}
   .pill.up{background:rgba(63,185,80,.15);color:var(--ok);border-color:rgba(63,185,80,.4)}
@@ -81,6 +86,8 @@
   body.tv header{padding:18px 32px}
   body.tv header h1{font-size:30px}
   body.tv header .sub{font-size:17px}
+  body.tv header .verdict{font-size:21px}
+  body.tv .strip i{height:20px}
   body.tv .pill{font-size:22px;padding:10px 24px}
   body.tv main{max-width:none;padding:22px 32px 40px}
   body.tv .grid{gap:18px}
@@ -109,9 +116,10 @@
 </head>
 <body>
 <header>
-  <div>
+  <div style="min-width:0">
     <h1>netdash</h1>
-    <div class="sub" id="updated">connecting…</div>
+    <div class="verdict" id="verdict">connecting…</div>
+    <div class="sub" id="updated"></div>
   </div>
   <div class="pill" id="status">—</div>
   <button class="tvbtn" id="tv-toggle" title="Bigger layout for the TV">TV</button>
@@ -125,7 +133,16 @@
     <div class="panel tile"><h2>Line usage now</h2><div class="v" id="t-nic">—</div><div class="s" id="t-nic-s">whole house, down / up</div></div>
     <div class="panel tile"><h2>Pi-hole blocked</h2><div class="v" id="t-blk">—</div><div class="s" id="t-blk-s">—</div></div>
     <div class="panel tile"><h2>Router</h2><div class="v" id="t-rt">—</div><div class="s" id="t-rt-s">—</div></div>
+    <div class="panel tile"><h2>Services</h2><div class="v" id="t-svc">—</div><div class="s" id="t-svc-s">—</div></div>
     <div class="panel tile"><h2>HTPC</h2><div class="v" id="t-mc">—</div><div class="s" id="t-mc-s">—</div></div>
+  </div>
+
+  <div class="panel wide" style="margin-bottom:14px">
+    <h2>Service status <span class="r" id="svc-note">24h · 48 half-hour blocks · checked every 2 min from this network</span></h2>
+    <div class="scroll"><table id="services">
+      <thead><tr><th></th><th>Service</th><th style="width:40%">Last 24h</th><th class="num">Uptime</th><th class="num">Response</th><th>Last issue</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
   </div>
 
   <div class="grid cols2">
@@ -303,6 +320,11 @@ async function loadOverview(){
   const up = o.internet_up, inet=o.latest.internet, gw=o.latest.gateway;
   const st=$('#status'); st.textContent = up?'INTERNET UP':'INTERNET DOWN'; st.className='pill '+(up?'up':'down');
   $('#updated').textContent = 'updated '+fmtTS(o.now)+' · auto-refresh every 30s · probing '+o.targets.internet+' every 60s';
+  const v=o.verdict||{}; const ve=$('#verdict'); ve.textContent=v.text||'—'; ve.className='verdict '+(v.level||''); ve.title=v.text||'';
+  const sv=o.services||{};
+  if(sv.total){ const allUp = sv.up===sv.total;
+    $('#t-svc').innerHTML = '<span class="'+(allUp?'ok':sv.down.length?'bad':'warn')+'">'+sv.up+'/'+sv.total+'</span>';
+    $('#t-svc-s').textContent = allUp ? 'all reachable from here' : (sv.down.length ? 'down: '+sv.down.join(', ') : 'one blip, re-checking'); }
 
   if(inet){ const lat=inet.rtt_avg; $('#t-lat').textContent = lat==null?'—':num(lat,1)+' ms';
     $('#t-lat').className='v '+(lat==null?'bad':lat<30?'ok':lat<80?'warn':'bad');
@@ -429,6 +451,25 @@ async function loadWifi(){
     tb.appendChild(tr); }
   if(!cl.length) tb.innerHTML='<tr><td colspan="8" class="empty">no WiFi data yet — router syslog is ingested every 5 min</td></tr>';
 }
+async function loadServices(){
+  const s = await j('/api/services'); const tb=$('#services tbody'); tb.innerHTML='';
+  $('#svc-note').textContent = '24h · 48 half-hour blocks · checked every '+Math.round(s.interval/60)+' min from this network';
+  for(const x of s.services){ const tr=document.createElement('tr');
+    const strip = x.strip.map(b => '<i class="'+(b==null?'':b>=1?'ok':b<=0?'bad':'warn')+'" title="'+(b==null?'no data':Math.round(b*100)+'% up')+'"></i>').join('');
+    const upC = x.uptime==null?'':x.uptime>=99.5?'ok':x.uptime>=95?'warn':'bad';
+    const dot = x.down?'bad':x.ok?'on':'';
+    const issue = x.down ? '<span class="bad">'+x.reason+' · now</span>'
+                : x.last_fail ? '<span style="color:var(--dim)">'+x.last_fail_reason+' · '+ago(x.last_fail)+'</span>'
+                : '<span style="color:var(--muted)">none</span>';
+    tr.innerHTML = '<td><span class="dot '+dot+'" style="'+(dot==='bad'?'background:var(--bad);box-shadow:0 0 6px rgba(248,81,73,.6)':'')+'"></span></td>'+
+      '<td><b>'+x.name+'</b></td>'+
+      '<td><div class="strip">'+strip+'</div></td>'+
+      '<td class="num '+upC+'">'+(x.uptime==null?'—':num(x.uptime,x.uptime<99.95?1:0)+'%')+'</td>'+
+      '<td class="num" style="color:var(--dim)">'+(x.ttfb_ms==null?'—':Math.round(x.ttfb_ms)+' ms')+'</td>'+
+      '<td>'+issue+'</td>';
+    tb.appendChild(tr); }
+  if(!s.services.length) tb.innerHTML='<tr><td colspan="6" class="empty">no services configured</td></tr>';
+}
 async function loadEvents(){
   const [ev, msg] = await Promise.all([j('/api/events?hours=168'), j('/api/pihole/messages')]);
   const items = [];
@@ -444,7 +485,7 @@ async function loadEvents(){
 
 // -------------------------------------------------------------- refresh ---
 async function refresh(){
-  const tasks=[loadOverview(), loadWan(), loadThroughput(), loadMachine(), loadPihole(), loadDevices(), loadWifi(), loadEvents()];
+  const tasks=[loadOverview(), loadServices(), loadWan(), loadThroughput(), loadMachine(), loadPihole(), loadDevices(), loadWifi(), loadEvents()];
   const res = await Promise.allSettled(tasks);
   const failed = res.filter(r=>r.status==='rejected');
   if(failed.length){ console.warn(failed.map(f=>f.reason)); $('#updated').textContent += ' · '+failed.length+' panel(s) failed'; }
