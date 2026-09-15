@@ -337,7 +337,7 @@ async def check_service(name: str, url: str) -> dict:
 
 async def mdns_name(ip: str) -> str | None:
     """Reverse mDNS lookup: Apple devices, Linux boxes and smart TVs answer with
-    'Darrens-iPhone.local'. IoT gear and most Android phones don't."""
+    'Sams-iPhone.local'. IoT gear and most Android phones don't."""
     out = await run(["avahi-resolve-address", ip], timeout=4)
     parts = out.split()
     if len(parts) < 2 or not parts[1].endswith(".local"):
