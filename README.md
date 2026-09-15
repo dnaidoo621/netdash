@@ -54,7 +54,7 @@ When the line is saturated the verdict names the device responsible: *"line satu
 
 **Click any device** in the Devices or WiFi tables to expand its last 24h: signal strength, download rate, and each disconnect drawn as a red bar whose height is the signal at the moment it dropped. `?device=AA:BB:CC:DD:EE:FF` deep-links straight to one. This is how you answer *"was the phone on weak signal during that call?"*
 
-**Device names, automatically.** Every 10 minutes each device with an IP gets a reverse mDNS lookup — Apple devices, Macs, Linux boxes and smart TVs answer with their real name (*Darrens iPhone*, *Living-Room-TV*). Anything that doesn't answer (IoT plugs, most Android) you can name yourself: hover a row, click the pencil, type, Enter. Manual names win over discovered ones and are never overwritten. Names flow into every panel, including the verdict: *"line saturated — Darrens iPhone alone is pulling 19."*
+**Device names, automatically.** Every 10 minutes each device with an IP gets a reverse mDNS lookup — Apple devices, Macs, Linux boxes and smart TVs answer with their real name (*Sams-iPhone*, *Living-Room-TV*). Anything that doesn't answer (IoT plugs, most Android) you can name yourself: hover a row, click the pencil, type, Enter. Manual names win over discovered ones and are never overwritten. Names flow into every panel, including the verdict: *"line saturated — Sams iPhone alone is pulling 19."*
 
 **Data used** — approximate bytes per device over 30 days, from the router's per-client rate integrated over time. It's rate × interval, not a meter, so treat it as a ranking rather than a bill — but *"the TV used 41 GB"* explains a lot of buffering evenings.
 
