@@ -28,6 +28,14 @@
   .inc-ongoing{color:var(--bad);font-weight:600}
   tr.clickable{cursor:pointer}
   tr.clickable:hover td{background:rgba(88,166,255,.06)}
+  button.edit{background:none;border:0;color:var(--muted);cursor:pointer;font-size:12px;padding:0 4px;opacity:0;vertical-align:middle}
+  tr:hover button.edit{opacity:1}
+  button.edit:hover{color:var(--acc)}
+  .btn{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;font-weight:600}
+  .btn:hover{border-color:var(--acc)}
+  .btn:disabled{opacity:.5;cursor:default}
+  .delta{font-size:11px;margin-left:6px}
+  .delta.up{color:var(--ok)}.delta.down{color:var(--bad)}.delta.flat{color:var(--muted)}
   tr.detail td{background:var(--panel2);border-bottom:1px solid var(--line)}
   #report .tile h2{margin-bottom:4px}
   .pill{margin-left:auto;padding:6px 14px;border-radius:999px;font-weight:700;font-size:13px;
@@ -68,7 +76,7 @@
   .list .t{color:var(--muted);font-variant-numeric:tabular-nums;font-size:12px;flex:0 0 118px}
   .list .k{font-weight:600;flex:0 0 auto}
   .list .d{color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .k.internet_down,.k.wan_offline{color:var(--bad)}.k.internet_up,.k.wan_online{color:var(--ok)}.k.packet_loss{color:var(--warn)}
+  .k.internet_down,.k.wan_offline,.k.host_down{color:var(--bad)}.k.internet_up,.k.wan_online,.k.host_up{color:var(--ok)}.k.packet_loss,.k.router_reboot{color:var(--warn)}
   .k.CONNECTION_ERROR,.k.collector_error{color:var(--warn)}
   .range{display:inline-flex;gap:4px}
   .range button{background:var(--panel2);color:var(--dim);border:1px solid var(--line);
@@ -79,11 +87,18 @@
   .empty{color:var(--muted);font-size:13px;padding:18px 0;text-align:center}
   .scroll{overflow-x:auto}
   .err{color:var(--bad);font-size:12px}
+  .pill{white-space:nowrap}
   @media (max-width:700px){
     main{padding:12px}
     .cols2,.cols3{grid-template-columns:1fr}
-    header{padding:12px}
+    header{padding:10px 12px;gap:10px;flex-wrap:wrap}
+    header h1{font-size:16px}
+    /* The verdict is the point of the page — never truncate it on a phone. */
+    header .verdict{white-space:normal;font-size:13px;line-height:1.3}
+    header .sub .extra{display:none}
+    .pill{font-size:12px;padding:5px 10px;margin-left:0}
     .tile .v{font-size:22px}
+    .tile h2 .btn{padding:2px 7px;font-size:10px}
   }
   /* TV mode — 1080p viewed from across the room. Bigger everything, fewer panels. */
   .tvbtn{background:var(--panel2);color:var(--dim);border:1px solid var(--line);border-radius:8px;
@@ -136,7 +151,7 @@
   <div class="grid tiles" style="margin-bottom:14px">
     <div class="panel tile"><h2>Internet latency</h2><div class="v" id="t-lat">—</div><div class="s" id="t-lat-s">to 1.1.1.1</div></div>
     <div class="panel tile"><h2>Packet loss · 24h</h2><div class="v" id="t-loss">—</div><div class="s" id="t-loss-s">—</div></div>
-    <div class="panel tile"><h2>Throughput</h2><div class="v" id="t-tp">—</div><div class="s" id="t-tp-s">—</div></div>
+    <div class="panel tile"><h2>Throughput <button class="btn r" id="test-now" title="run a speed test now (skipped if the line is busy)">test now</button></h2><div class="v" id="t-tp">—</div><div class="s" id="t-tp-s">—</div></div>
     <div class="panel tile"><h2>Line usage now</h2><div class="v" id="t-nic">—</div><div class="s" id="t-nic-s">whole house, down / up</div></div>
     <div class="panel tile"><h2>Pi-hole blocked</h2><div class="v" id="t-blk">—</div><div class="s" id="t-blk-s">—</div></div>
     <div class="panel tile"><h2>Router</h2><div class="v" id="t-rt">—</div><div class="s" id="t-rt-s">—</div></div>
@@ -225,8 +240,17 @@
     </div>
 
     <div class="panel wide">
-      <h2>Last 30 days <span class="r" id="rep-note">what your ISP actually delivered</span></h2>
+      <h2>Last 30 days <span class="r" id="rep-note">what your ISP actually delivered</span>
+        <button class="btn" id="copy-isp" style="margin-left:10px" title="copy a plain-text summary for your ISP">copy for ISP</button></h2>
       <div class="grid tiles" id="report"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Data used <span class="r" id="usage-note">30 days · approximate</span></h2>
+      <div class="scroll"><table id="usage">
+        <thead><tr><th>Device</th><th class="num">Down</th><th class="num">Up</th><th>Share</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
     </div>
 
     <div class="panel">
@@ -281,6 +305,32 @@ function anonName(x){
   return (_anonLabel[x.mac] = cat+' '+_anonCount[cat]);
 }
 const anonMac = m => DEMO ? MASK_MAC : m;
+
+// ---------------------------------------------------------- device names ---
+// Name cell: the name (or masked MAC), a source hint, and a rename pencil. Renames
+// are disabled in demo mode so a screenshot can't leak the real name mid-edit.
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function nameCell(x, shown){
+  const src = x.name_source && !DEMO ? '<span class="tag" title="name from '+esc(x.name_source)+'">'+esc(x.name_source)+'</span>' : '';
+  const body = shown ? '<span class="nm">'+esc(shown)+'</span>' : '<span class="nm" style="color:var(--muted)">'+esc(anonMac(x.mac))+'</span>';
+  const pen  = (!DEMO && x.mac) ? ' <button class="edit" data-mac="'+esc(x.mac)+'" data-name="'+esc(x.name||'')+'" title="rename">✎</button>' : '';
+  return body + src + pen;
+}
+async function renameDevice(btn){
+  const td = btn.closest('td'); const mac = btn.dataset.mac; const cur = btn.dataset.name || '';
+  const inp = document.createElement('input'); inp.type='text'; inp.value=cur; inp.maxLength=48; inp.placeholder='name this device';
+  inp.style.cssText='font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--acc);border-radius:5px;padding:2px 6px;width:180px';
+  const old = td.innerHTML; td.innerHTML=''; td.appendChild(inp); inp.focus(); inp.select();
+  let done=false;
+  const finish = async (save) => { if(done) return; done=true;
+    if(!save || inp.value.trim()===cur){ td.innerHTML=old; return; }
+    try{ const r = await fetch('/api/devices/name',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({mac, name: inp.value.trim()})});
+      if(!r.ok) throw new Error('save failed '+r.status);
+      delete _anonLabel[mac]; loadDevices(); loadWifi(); loadUsage(); }
+    catch(e){ td.innerHTML=old; alert(e.message); } };
+  inp.addEventListener('keydown', e=>{ if(e.key==='Enter') finish(true); if(e.key==='Escape') finish(false); });
+  inp.addEventListener('blur', ()=>finish(true));
+}
 
 // ------------------------------------------------------------- charts ---
 // Minimal time-series canvas chart. series: [{pts:[[ts,val]], color, width, fill, axis:'l'|'r', bars}]
@@ -340,7 +390,7 @@ async function loadOverview(){
   const o = await j('/api/overview');
   const up = o.internet_up, inet=o.latest.internet, gw=o.latest.gateway;
   const st=$('#status'); st.textContent = up?'INTERNET UP':'INTERNET DOWN'; st.className='pill '+(up?'up':'down');
-  $('#updated').textContent = 'updated '+fmtTS(o.now)+' · auto-refresh every 30s · probing '+o.targets.internet+' every 60s';
+  $('#updated').innerHTML = 'updated '+fmtTS(o.now)+'<span class="extra"> · auto-refresh every 30s · probing '+esc(o.targets.internet)+' every 60s</span>';
   const v=o.verdict||{}; let vt=v.text||'—';
   if(v.hog){ const label = anonName({name:v.hog.name, mac:v.hog.mac, vendor:''}) || v.hog.name || (DEMO?MASK_MAC:v.hog.mac) || 'a device';
     vt = vt.replace('{hog}', label); }
@@ -446,7 +496,7 @@ async function loadDevices(){
     const nm = anonName(x);
     if(x.mac){ tr.dataset.mac=x.mac; tr.dataset.label=nm||anonMac(x.mac); tr.className='clickable'; tr.title='click for 24h signal + rate'; }
     tr.innerHTML = '<td><span class="dot '+(x.online?'on':'')+'"></span></td>'+
-      '<td>'+(nm||'<span style="color:var(--muted)">'+anonMac(x.mac)+'</span>')+'</td>'+
+      '<td>'+nameCell(x, nm)+'</td>'+
       '<td style="font-variant-numeric:tabular-nums">'+x.ip+'</td>'+
       '<td style="color:var(--dim)">'+(x.band||'<span style="color:var(--muted)">—</span>')+'</td>'+
       '<td class="num">'+sig(x.signal_db)+'</td>'+
@@ -471,7 +521,7 @@ async function loadWifi(){
     const nm = anonName(c);
     tr.dataset.mac=c.mac; tr.dataset.label=nm||anonMac(c.mac); tr.className='clickable'; tr.title='click for 24h signal + drops';
     tr.innerHTML = '<td><span class="dot '+(c.online?'on':'')+'"></span></td>'+
-      '<td>'+(nm||'<span style="color:var(--muted)">'+anonMac(c.mac)+'</span>')+(c.ip?' <span style="color:var(--muted);font-size:11px">'+c.ip+'</span>':'')+'</td>'+
+      '<td>'+nameCell(c, nm)+(c.ip?' <span style="color:var(--muted);font-size:11px">'+c.ip+'</span>':'')+'</td>'+
       '<td style="color:var(--dim)">'+(c.band||'—')+'</td>'+
       '<td class="num">'+sig(c.signal_now)+'</td>'+
       '<td class="num">'+sig(c.sig_worst)+'</td>'+
@@ -532,7 +582,10 @@ async function toggleDevice(tr, silent){
     ], {tMin: d.since, tMax: now, lMax: 80, rightAxis:true, rMax: dmax*1.15, rUnit:''});
   }catch(e){ det.querySelector('td').innerHTML='<div class="err">'+e.message+'</div>'; }
 }
-document.addEventListener('click', e=>{ const tr=e.target.closest('tr.clickable'); if(tr) toggleDevice(tr); });
+document.addEventListener('click', e=>{
+  const pen=e.target.closest('button.edit'); if(pen){ e.stopPropagation(); renameDevice(pen); return; }
+  if(e.target.closest('input')) return;                       // typing a name, not drilling down
+  const tr=e.target.closest('tr.clickable'); if(tr) toggleDevice(tr); });
 // Deep link: ?device=AA:BB:CC:DD:EE:FF opens that device's chart in the WiFi table on load.
 try{ const dm=new URLSearchParams(location.search).get('device'); if(dm) openDetail={table:'wifi', mac:dm.toUpperCase()}; }catch(e){}
 function reopenDetail(tableId){
@@ -555,22 +608,78 @@ async function loadIncidents(){
     tb.appendChild(tr); }
   if(!d.incidents.length) tb.innerHTML='<tr><td colspan="5" class="empty">nothing to report</td></tr>';
 }
-async function loadReport(){
-  const r = await j('/api/report?days=30'); const el=$('#report'); el.innerHTML='';
-  $('#rep-note').textContent = 'what your ISP actually delivered · based on '+r.covered_days+' day'+(r.covered_days===1?'':'s')+' of data';
-  const tile=(h,v,s,c='')=>{ const d=document.createElement('div'); d.className='tile';
-    d.style.cssText='background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px 12px';
-    d.innerHTML='<h2>'+h+'</h2><div class="v '+c+'" style="font-size:22px">'+v+'</div><div class="s">'+s+'</div>'; el.appendChild(d); };
-  const up=r.uptime_pct;
-  tile('Uptime', up==null?'—':up.toFixed(2)+'%', r.outages+' outage'+(r.outages===1?'':'s')+' · '+fmtDur(r.outage_s)+' total', up==null?'':up>=99.9?'ok':up>=99?'warn':'bad');
-  tile('Longest outage', r.longest_s?fmtDur(r.longest_s):'none', r.worst_outage_day?('worst day '+r.worst_outage_day.date+' · '+fmtDur(r.worst_outage_day.outage_s)):'—', r.longest_s>600?'bad':r.longest_s>120?'warn':'ok');
-  const sp=r.speed;
-  if(r.plan_mbps){ const p=r.pct_of_plan; tile('Delivered vs plan', p==null?'—':p+'%', 'avg '+num(sp.avg,1)+' of '+num(r.plan_mbps,0)+' Mbps · '+sp.samples+' tests', p==null?'':p>=85?'ok':p>=60?'warn':'bad'); }
-  else tile('Average speed', sp.avg==null?'—':num(sp.avg,1)+' Mbps', 'set PLAN_DOWN_MBPS to compare with your plan · '+sp.samples+' tests', 'acc');
-  tile('Slowest 10%', sp.p10==null?'—':num(sp.p10,1)+' Mbps', r.worst_speed_day?('worst day '+r.worst_speed_day.date+' · '+num(r.worst_speed_day.mbps,1)+' Mbps avg'):('min '+num(sp.min,1)+' · max '+num(sp.max,1)), sp.p10==null?'':(r.plan_mbps&&sp.p10<0.5*r.plan_mbps)?'bad':'');
-  tile('Packet loss', num(r.loss_avg,2)+'%', 'to 1.1.1.1 · max rtt '+num(r.rtt_max,0)+' ms', r.loss_avg<0.5?'ok':r.loss_avg<3?'warn':'bad');
-  tile('WiFi disconnects', r.wifi_drops.toLocaleString(), 'logged by the router', r.wifi_drops>200?'warn':'');
+let lastReport = null;
+// "vs previous period" marker. higherIsBetter decides the colour; the arrow shows direction.
+function delta(cur, prev, higherIsBetter, fmt){
+  if(cur==null || prev==null) return '';
+  const d = cur - prev; if(Math.abs(d) < 1e-9) return '<span class="delta flat">= last period</span>';
+  const good = higherIsBetter ? d>0 : d<0;
+  return '<span class="delta '+(good?'up':'down')+'" title="previous period: '+fmt(prev)+'">'+(d>0?'▲':'▼')+' from '+fmt(prev)+'</span>';
 }
+async function loadReport(){
+  const r = await j('/api/report?days=30'); lastReport = r; const el=$('#report'); el.innerHTML='';
+  const p = r.previous;
+  $('#rep-note').textContent = 'what your ISP actually delivered · based on '+r.covered_days+' day'+(r.covered_days===1?'':'s')+' of data'+(p?' · vs the '+r.days+' days before':'');
+  const tile=(h,v,s,c='',dl='')=>{ const d=document.createElement('div'); d.className='tile';
+    d.style.cssText='background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px 12px';
+    d.innerHTML='<h2>'+h+'</h2><div class="v '+c+'" style="font-size:22px">'+v+dl+'</div><div class="s">'+s+'</div>'; el.appendChild(d); };
+  const pct1 = v=>v.toFixed(2)+'%', mb = v=>num(v,1)+' Mbps', n0 = v=>String(v), pctI = v=>v+'%';
+  const up=r.uptime_pct;
+  tile('Uptime', up==null?'—':up.toFixed(2)+'%', r.outages+' outage'+(r.outages===1?'':'s')+' · '+fmtDur(r.outage_s)+' total', up==null?'':up>=99.9?'ok':up>=99?'warn':'bad', p?delta(up,p.uptime_pct,true,pct1):'');
+  tile('Longest outage', r.longest_s?fmtDur(r.longest_s):'none', r.worst_outage_day?('worst day '+r.worst_outage_day.date+' · '+fmtDur(r.worst_outage_day.outage_s)):'—', r.longest_s>600?'bad':r.longest_s>120?'warn':'ok', p?delta(r.longest_s,p.longest_s,false,fmtDur):'');
+  const sp=r.speed;
+  if(r.plan_mbps){ const pc=r.pct_of_plan; tile('Delivered vs plan', pc==null?'—':pc+'%', 'avg '+num(sp.avg,1)+' of '+num(r.plan_mbps,0)+' Mbps · '+sp.samples+' tests', pc==null?'':pc>=85?'ok':pc>=60?'warn':'bad', p?delta(pc,p.pct_of_plan,true,pctI):''); }
+  else tile('Average speed', sp.avg==null?'—':num(sp.avg,1)+' Mbps', 'set PLAN_DOWN_MBPS to compare with your plan · '+sp.samples+' tests', 'acc', p?delta(sp.avg,p.speed.avg,true,mb):'');
+  tile('Slowest 10%', sp.p10==null?'—':num(sp.p10,1)+' Mbps', r.worst_speed_day?('worst day '+r.worst_speed_day.date+' · '+num(r.worst_speed_day.mbps,1)+' Mbps avg'):('min '+num(sp.min,1)+' · max '+num(sp.max,1)), sp.p10==null?'':(r.plan_mbps&&sp.p10<0.5*r.plan_mbps)?'bad':'', p?delta(sp.p10,p.speed.p10,true,mb):'');
+  tile('Packet loss', num(r.loss_avg,2)+'%', 'to 1.1.1.1 · max rtt '+num(r.rtt_max,0)+' ms', r.loss_avg<0.5?'ok':r.loss_avg<3?'warn':'bad', p?delta(r.loss_avg,p.loss_avg,false,pct1):'');
+  tile('WiFi disconnects', r.wifi_drops.toLocaleString(), 'logged by the router', r.wifi_drops>200?'warn':'', p?delta(r.wifi_drops,p.wifi_drops,false,n0):'');
+}
+async function loadUsage(){
+  const u = await j('/api/devices/usage?days=30'); const tb=$('#usage tbody'); tb.innerHTML='';
+  $('#usage-note').textContent = '30 days · '+num(u.total_gb,1)+' GB total · approximate (rate × time)';
+  const top = u.devices.filter(d=>d.gb_down+d.gb_up>=0.01).slice(0,12);
+  for(const d of top){ const tr=document.createElement('tr'); const share=u.total_gb?((d.gb_down+d.gb_up)/u.total_gb*100):0;
+    const nm = anonName({name:d.name, mac:d.mac, vendor:''});
+    tr.innerHTML='<td>'+(nm?esc(nm):'<span style="color:var(--muted)">'+esc(anonMac(d.mac))+'</span>')+'</td>'+
+      '<td class="num">'+num(d.gb_down,d.gb_down<10?2:1)+' GB</td><td class="num" style="color:var(--dim)">'+num(d.gb_up,d.gb_up<10?2:1)+' GB</td>'+
+      '<td style="white-space:nowrap"><span class="bar" style="display:inline-block;width:64px;min-width:0;vertical-align:middle"><i style="width:'+share+'%"></i></span> <span style="color:var(--dim);font-size:11px">'+Math.round(share)+'%</span></td>';
+    tb.appendChild(tr); }
+  if(!top.length) tb.innerHTML='<tr><td colspan="4" class="empty">no router data yet</td></tr>';
+}
+// Plain-text summary for the ISP support chat. navigator.clipboard needs HTTPS; on plain
+// HTTP we fall back to a selected textarea so a Cmd/Ctrl-C still works.
+async function copyForISP(){
+  const r = lastReport; if(!r) return;
+  const inc = await j('/api/incidents?hours='+(r.days*24));
+  const L = [];
+  L.push('Connection report — last '+r.days+' days (measured from inside the home network, '+r.covered_days+' days of data)');
+  L.push('');
+  L.push('Uptime: '+(r.uptime_pct==null?'n/a':r.uptime_pct.toFixed(2)+'%')+'  ·  outages: '+r.outages+'  ·  total downtime: '+fmtDur(r.outage_s)+'  ·  longest: '+fmtDur(r.longest_s));
+  if(r.plan_mbps) L.push('Speed: average '+num(r.speed.avg,1)+' Mbps against a '+num(r.plan_mbps,0)+' Mbps plan ('+r.pct_of_plan+'%), slowest 10% of tests '+num(r.speed.p10,1)+' Mbps, '+r.speed.samples+' tests');
+  else L.push('Speed: average '+num(r.speed.avg,1)+' Mbps, slowest 10% of tests '+num(r.speed.p10,1)+' Mbps, '+r.speed.samples+' tests');
+  L.push('Packet loss to 1.1.1.1: '+num(r.loss_avg,2)+'%');
+  if(r.worst_speed_day) L.push('Worst speed day: '+r.worst_speed_day.date+' ('+num(r.worst_speed_day.mbps,1)+' Mbps average)');
+  L.push('');
+  const isp = inc.incidents.filter(i=>!i.where.startsWith('HTPC'));
+  L.push('Outages ('+isp.length+'):');
+  for(const i of isp) L.push('  '+fmtDT(i.start)+(i.ongoing?' – ongoing':' – '+fmtT(i.end))+'  '+fmtDur(i.duration)+'  '+i.where);
+  if(!isp.length) L.push('  none');
+  L.push('');
+  L.push('Every outage above was seen with the home router reachable and the line to the ISP unreachable.');
+  const text = L.join('\n');
+  try{ await navigator.clipboard.writeText(text); flash($('#copy-isp'),'copied'); }
+  catch(e){ const ta=document.createElement('textarea'); ta.value=text; ta.style.cssText='position:fixed;left:8px;bottom:8px;width:min(720px,95vw);height:260px;z-index:99;background:var(--panel);color:var(--fg);border:1px solid var(--acc);border-radius:8px;padding:10px;font:12px monospace';
+    document.body.appendChild(ta); ta.select(); try{ document.execCommand('copy'); flash($('#copy-isp'),'copied'); }catch(_){ flash($('#copy-isp'),'select & copy'); }
+    ta.addEventListener('blur', ()=>ta.remove()); }
+}
+function flash(btn, msg){ const t=btn.textContent; btn.textContent=msg; btn.disabled=true; setTimeout(()=>{btn.textContent=t; btn.disabled=false;}, 1800); }
+$('#copy-isp').addEventListener('click', copyForISP);
+$('#test-now').addEventListener('click', async e=>{ e.stopPropagation(); const b=e.currentTarget; b.disabled=true; b.textContent='testing…';
+  try{ const r = await (await fetch('/api/speedtest',{method:'POST'})).json();
+    if(r.skipped){ b.textContent='skipped'; $('#t-tp-s').textContent = r.reason+' — try again in a minute'; }
+    else { b.textContent=num(r.mbps,0)+' Mbps'; loadOverview(); loadThroughput(); }
+  }catch(err){ b.textContent='failed'; }
+  setTimeout(()=>{ b.textContent='test now'; b.disabled=false; }, 4000); });
 async function loadEvents(){
   const [ev, msg] = await Promise.all([j('/api/events?hours=168'), j('/api/pihole/messages')]);
   const items = [];
@@ -586,7 +695,7 @@ async function loadEvents(){
 
 // -------------------------------------------------------------- refresh ---
 async function refresh(){
-  const tasks=[loadOverview(), loadServices(), loadWan(), loadThroughput(), loadMachine(), loadPihole(), loadDevices(), loadWifi(), loadIncidents(), loadReport(), loadEvents()];
+  const tasks=[loadOverview(), loadServices(), loadWan(), loadThroughput(), loadMachine(), loadPihole(), loadDevices(), loadWifi(), loadIncidents(), loadReport(), loadUsage(), loadEvents()];
   const res = await Promise.allSettled(tasks);
   const failed = res.filter(r=>r.status==='rejected');
   if(failed.length){ console.warn(failed.map(f=>f.reason)); $('#updated').textContent += ' · '+failed.length+' panel(s) failed'; }

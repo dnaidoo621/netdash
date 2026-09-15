@@ -18,6 +18,7 @@ import httpx
 from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from router import Router
 
@@ -149,6 +150,10 @@ CREATE TABLE IF NOT EXISTS services (
 CREATE INDEX IF NOT EXISTS ix_services ON services(name, ts);
 CREATE TABLE IF NOT EXISTS service_seen (
     name TEXT PRIMARY KEY, last_seen INTEGER NOT NULL, queries INTEGER
+);
+-- Friendly device names: manual overrides and mDNS discoveries.
+CREATE TABLE IF NOT EXISTS device_names (
+    mac TEXT PRIMARY KEY, name TEXT NOT NULL, source TEXT NOT NULL, updated INTEGER NOT NULL
 );
 -- Hourly rollups. Column names match the raw tables where the UI reads them.
 CREATE TABLE IF NOT EXISTS probes_h (
@@ -330,6 +335,32 @@ async def check_service(name: str, url: str) -> dict:
     return row
 
 
+async def mdns_name(ip: str) -> str | None:
+    """Reverse mDNS lookup: Apple devices, Linux boxes and smart TVs answer with
+    'Darrens-iPhone.local'. IoT gear and most Android phones don't."""
+    out = await run(["avahi-resolve-address", ip], timeout=4)
+    parts = out.split()
+    if len(parts) < 2 or not parts[1].endswith(".local"):
+        return None
+    name = parts[1][:-len(".local")].replace("-", " ").strip()
+    return name if name and name.lower() not in ("localhost",) else None
+
+
+def name_map() -> dict[str, dict]:
+    return {r["mac"]: dict(r) for r in rows("SELECT mac,name,source,updated FROM device_names")}
+
+
+def best_name(mac: str, *candidates: str | None, names: dict[str, dict] | None = None) -> str:
+    """manual > mDNS > whatever the router/Pi-hole said."""
+    n = (names if names is not None else name_map()).get((mac or "").upper())
+    if n:
+        return n["name"]
+    for c in candidates:
+        if c and c.lower() != "unknown":
+            return c
+    return ""
+
+
 def read_pkg_temp() -> float | None:
     for z in Path("/sys/class/thermal").glob("thermal_zone*"):
         try:
@@ -378,6 +409,65 @@ class Collector:
         self.services_now: dict[str, dict] = {}
         # [{"name","url","source":"pinned"|"auto","queries"}] — rebuilt by detect_services()
         self.services_active: list[dict] = []
+        self.router_uptime_s: int | None = None
+
+    # -------------------------------------------------------- names --
+    async def names_cycle(self):
+        """Resolve mDNS names for everything with an IP; never overwrite a manual name."""
+        ips = {d["mac"]: d["ip"] for d in self.router_devices_now if d.get("ip")}
+        try:
+            ph = await pihole.safe("/api/network/devices", {"max_devices": 100, "max_addresses": 2})
+            for d in ph.get("devices", []):
+                mac = (d.get("hwaddr") or "").upper()
+                for i in d.get("ips", []):
+                    ip = i.get("ip") or ""
+                    if mac and ip and ":" not in ip and ip != "0.0.0.0" and mac not in ips:
+                        ips[mac] = ip
+        except Exception:
+            pass
+        # Pi-hole uses pseudo-MACs like "IP-192.168.10.158" for things it only knows by
+        # address; those aren't devices we can name.
+        macs = [m for m in ips if re.fullmatch(r"[0-9A-F]{2}(:[0-9A-F]{2}){5}", m)]
+        if not macs:
+            return
+        found = await asyncio.gather(*(mdns_name(ips[m]) for m in macs))
+        ts = int(time.time())
+        with db() as conn:
+            for mac, name in zip(macs, found):
+                if name:
+                    conn.execute(
+                        "INSERT INTO device_names(mac,name,source,updated) VALUES (?,?,'mdns',?) "
+                        "ON CONFLICT(mac) DO UPDATE SET name=excluded.name, updated=excluded.updated "
+                        "WHERE device_names.source != 'manual'", (mac, name, ts))
+
+    # ---------------------------------------------- gap / reboot detection --
+    def detect_own_gap(self):
+        """If the last probe is old, netdash (or the whole HTPC) was down. Record it so the
+        Aug-1-style hard power-off shows up as an incident instead of silence."""
+        r = rows("SELECT MAX(ts) m FROM probes")
+        last = r[0]["m"] if r else None
+        now = int(time.time())
+        if last and now - last > 5 * 60:
+            mins = (now - last) // 60
+            with db() as conn:
+                conn.execute("INSERT INTO events(ts,kind,detail) VALUES (?,?,?)",
+                             (last, "host_down", f"netdash stopped reporting (HTPC off, asleep or rebooted?)"))
+                conn.execute("INSERT INTO events(ts,kind,detail) VALUES (?,?,?)",
+                             (now, "host_up", f"netdash back after {mins} min"))
+
+    def note_router_uptime(self, uptime_text: str | None):
+        """'13 Day 10:47:37' -> seconds; a decrease means the router rebooted."""
+        if not uptime_text:
+            return
+        m = re.match(r"(?:(\d+)\s*Day\s*)?(\d+):(\d+):(\d+)", uptime_text.strip())
+        if not m:
+            return
+        d, h, mi, s = (int(x or 0) for x in m.groups())
+        up = d * 86400 + h * 3600 + mi * 60 + s
+        if self.router_uptime_s is not None and up < self.router_uptime_s - 60:
+            add_event("router_reboot", f"Router rebooted (uptime reset; was up "
+                                       f"{self.router_uptime_s // 3600}h)")
+        self.router_uptime_s = up
 
     # ------------------------------------------------------ services --
     def rebuild_services(self):
@@ -453,6 +543,7 @@ class Collector:
             # Never surface the public IP or router MAC through the dashboard API.
             for k in ("Public IP", "MAC-Address"):
                 wan.pop(k, None)
+            self.note_router_uptime((sysinfo or {}).get("Uptime"))
             if wan or sysinfo or mesh:
                 self.router_info = {"wan": wan, "system": sysinfo, "mesh": mesh,
                                     "fetched": ts}
@@ -557,6 +648,10 @@ class Collector:
                              (int(time.time()), mbps))
 
     async def loop(self):
+        try:
+            self.detect_own_gap()
+        except Exception as e:
+            add_event("collector_error", f"gap detect: {e}"[:200])
         add_event("netdash_start", "Collector started")
         self.last_nic = (*read_nic_bytes(), time.time())
         try:
@@ -567,6 +662,7 @@ class Collector:
         next_syslog = 0.0
         next_svc = 0.0
         next_detect = 0.0
+        next_names = time.time() + 90      # after the first router poll has populated IPs
         next_prune = time.time() + 3600
         while True:
             started = time.time()
@@ -585,6 +681,9 @@ class Collector:
                 if started >= next_syslog:
                     next_syslog = started + SYSLOG_INTERVAL
                     asyncio.create_task(self.syslog_cycle())
+                if started >= next_names:
+                    next_names = started + 600
+                    asyncio.create_task(self.names_cycle())
                 if started >= next_prune:
                     next_prune = started + 3600
                     rollup()
@@ -696,7 +795,7 @@ async def overview():
                 line_cap=tp[0]["mbps"] if tp else None,
                 hog_mbps=hog_mbps)
     if "{hog}" in v["text"] and hog:
-        v["hog"] = {"name": hog.get("name") or "", "mac": hog.get("mac"),
+        v["hog"] = {"name": best_name(hog.get("mac", ""), hog.get("name")), "mac": hog.get("mac"),
                     "ip": hog.get("ip"), "mbps": round(hog_mbps or 0, 1)}
     return {
         "now": int(time.time()),
@@ -779,13 +878,14 @@ def services_summary(hours: float = 24, buckets: int = 48) -> list[dict]:
 def build_incidents(hours: float) -> list[dict]:
     """Group raw down/up events into outages with a duration, a cause, and collateral."""
     ev = rows("SELECT ts,kind,detail FROM events WHERE ts>? AND kind IN "
-              "('internet_down','internet_up','wan_offline','wan_online') ORDER BY ts",
-              since(hours))
+              "('internet_down','internet_up','wan_offline','wan_online','host_down','host_up') "
+              "ORDER BY ts", since(hours))
     now = int(time.time())
     windows, open_ = [], {}
+    SRC = {"internet": "netdash", "wan": "router", "host": "host"}
     for e in ev:
-        src = "netdash" if e["kind"].startswith("internet") else "router"
-        if e["kind"] in ("internet_down", "wan_offline"):
+        src = SRC[e["kind"].split("_")[0]]
+        if e["kind"] in ("internet_down", "wan_offline", "host_down"):
             open_[src] = (e["ts"], e["detail"])
         elif src in open_:
             s, d = open_.pop(src)
@@ -810,8 +910,12 @@ def build_incidents(hours: float) -> list[dict]:
         m["duration"] = end - m["start"]
         m["ongoing"] = m["end"] is None
         d = m["detail"] or ""
-        m["where"] = ("LAN — gateway was unreachable" if "gateway unreachable" in d
-                      else "ISP — gateway was fine, line was out")
+        if m["sources"] == {"host"}:
+            m["where"] = "HTPC — netdash wasn't running (power? reboot? sleep?)"
+        elif "gateway unreachable" in d:
+            m["where"] = "LAN — gateway was unreachable"
+        else:
+            m["where"] = "ISP — gateway was fine, line was out"
         fails = rows("SELECT DISTINCT name FROM services WHERE ok=0 AND ts BETWEEN ? AND ?",
                      m["start"] - 120, end + 120)
         m["services"] = [f["name"] for f in fails]
@@ -919,10 +1023,12 @@ async def router_wifi(hours: float = Query(24, ge=1, le=MAX_HOURS)):
     for r in sig:
         by.setdefault(r["mac"], {}).update(sig_worst=r["worst"], sig_avg=round(r["avg"] or 0),
                                            sig_best=r["best"])
+    names = name_map()
     out = []
     for mac, v in by.items():
         d = now.get(mac, {})
-        out.append({"mac": mac, "ip": d.get("ip", ""), "name": d.get("name", ""),
+        out.append({"mac": mac, "ip": d.get("ip", ""),
+                    "name": best_name(mac, d.get("name"), names=names),
                     "vendor": vendor.get(mac, ""),
                     "band": d.get("band", ""), "online": mac in now,
                     "signal_now": d.get("signal_db"),
@@ -932,6 +1038,73 @@ async def router_wifi(hours: float = Query(24, ge=1, le=MAX_HOURS)):
                     "sig_best": v.get("sig_best")})
     out.sort(key=lambda x: (-x["drops"], x["signal_now"] if x["signal_now"] is not None else 999))
     return {"hours": hours, "clients": out}
+
+
+
+class NameBody(BaseModel):
+    mac: str
+    name: str = ""
+
+
+@app.put("/api/devices/name")
+async def set_name(body: NameBody):
+    """Manual name for a MAC. Empty name clears the manual entry (mDNS may refill it)."""
+    mac = body.mac.upper().strip()
+    if not re.fullmatch(r"[0-9A-F]{2}(:[0-9A-F]{2}){5}", mac):
+        return JSONResponse({"error": "bad mac"}, status_code=400)
+    name = body.name.strip()[:48]
+    with db() as conn:
+        if name:
+            conn.execute("INSERT INTO device_names(mac,name,source,updated) VALUES (?,?,'manual',?) "
+                         "ON CONFLICT(mac) DO UPDATE SET name=excluded.name, source='manual', "
+                         "updated=excluded.updated", (mac, name, int(time.time())))
+        else:
+            conn.execute("DELETE FROM device_names WHERE mac=?", (mac,))
+    return {"mac": mac, "name": name, "source": "manual" if name else None}
+
+
+@app.get("/api/devices/usage")
+async def devices_usage(days: int = Query(30, ge=1, le=RETENTION_DAYS)):
+    """Approximate bytes per device: rate samples integrated over time. Raw samples are
+    60s apart (rate × 60); hourly rollups carry the hour's average (rate × 3600)."""
+    now = int(time.time())
+    s = now - days * 86400
+    raw_from = max(s, now - RAW_DAYS * 86400)
+    agg: dict[str, list] = {}
+    for r in rows("SELECT mac, SUM(down_kbps)*60/8/1e6 gb_down, SUM(up_kbps)*60/8/1e6 gb_up, "
+                  "MAX(ip) ip, MAX(name) name FROM router_devices WHERE ts>? GROUP BY mac", raw_from):
+        agg[r["mac"]] = [r["gb_down"] or 0, r["gb_up"] or 0, r["ip"], r["name"]]
+    if s < raw_from:
+        for r in rows("SELECT mac, SUM(down_avg)*3600/8/1e6 gb_down, SUM(up_avg)*3600/8/1e6 gb_up "
+                      "FROM router_devices_h WHERE ts>? AND ts<=? GROUP BY mac", s, raw_from):
+            a = agg.setdefault(r["mac"], [0, 0, "", ""])
+            a[0] += r["gb_down"] or 0; a[1] += r["gb_up"] or 0
+    names = name_map()
+    out = [{"mac": m, "ip": v[2] or "", "name": best_name(m, v[3], names=names),
+            "gb_down": round(v[0], 2), "gb_up": round(v[1], 2)} for m, v in agg.items()]
+    out.sort(key=lambda x: -(x["gb_down"] + x["gb_up"]))
+    total = sum(x["gb_down"] + x["gb_up"] for x in out)
+    return {"days": days, "total_gb": round(total, 2), "devices": out}
+
+
+@app.post("/api/speedtest")
+async def speedtest_now():
+    """On-demand speed test. Still refuses if the line is busy — a test that competes
+    with a stream measures the wrong thing and spoils the stream."""
+    rx0, _ = read_nic_bytes()
+    await asyncio.sleep(2)
+    rx1, _ = read_nic_bytes()
+    busy = (rx1 - rx0) * 8 / 2 / 1_000_000
+    rw = rows("SELECT rx_mbps FROM router_wan ORDER BY ts DESC LIMIT 1")
+    line_busy = rw[0]["rx_mbps"] if rw else 0
+    if busy > 3 or line_busy > 3:
+        return {"skipped": True, "reason": f"line busy ({max(busy, line_busy):.0f} Mbps in use)"}
+    mbps = await throughput_mbps()
+    if mbps is None:
+        return {"skipped": True, "reason": "test failed"}
+    with db() as conn:
+        conn.execute("INSERT INTO throughput VALUES (?,?)", (int(time.time()), mbps))
+    return {"skipped": False, "mbps": mbps}
 
 
 @app.get("/api/router/signal")
@@ -971,50 +1144,44 @@ async def machine(hours: float = Query(24, ge=1, le=MAX_HOURS)):
                 f"FROM {t} WHERE ts>? ORDER BY ts", since(hours))
 
 
-@app.get("/api/report")
-async def report(days: int = Query(30, ge=1, le=RETENTION_DAYS)):
-    """The numbers you'd put in front of your ISP: uptime, outages, delivered vs plan."""
-    hours = days * 24
-    s = since(hours)
-    inc = build_incidents(hours)
-    now = int(time.time())
+def report_window(start: int, end: int) -> dict:
+    """The numbers you'd put in front of your ISP, for one window. Only the time netdash
+    was actually watching counts — the router's syslog can report outages from before it
+    existed, and those would skew everything."""
+    hours = (end - start) / 3600
     first = rows("SELECT MIN(ts) m FROM (SELECT MIN(ts) ts FROM probes UNION ALL "
                  "SELECT MIN(ts) FROM probes_h)")[0]["m"]
-    cov_start = max(s, first or s)
-    covered_s = max(0, now - cov_start)
-    # The report covers only the window we were actually watching — the router's syslog
-    # can report outages from before netdash existed, and those would skew everything.
-    clipped = []
-    for i in inc:
-        a, b = max(i["start"], cov_start), min(i["end"] or now, now)
+    cov_start = max(start, first or start)
+    covered_s = max(0, end - cov_start)
+    inc = []
+    for i in build_incidents((int(time.time()) - start) / 3600):
+        a, b = max(i["start"], cov_start), min(i["end"] or end, end)
         if b > a:
-            clipped.append({**i, "start": a, "end": b, "duration": b - a})
-    inc = clipped
+            inc.append({**i, "start": a, "end": b, "duration": b - a})
     outage_s = sum(i["duration"] for i in inc)
     sp = rows("SELECT AVG(mbps) avg, MIN(mbps) min, MAX(mbps) max, COUNT(*) n "
-              "FROM throughput WHERE ts>?", s)[0]
-    p10 = rows("SELECT mbps FROM throughput WHERE ts>? ORDER BY mbps LIMIT 1 OFFSET "
-               "(SELECT COUNT(*)/10 FROM throughput WHERE ts>?)", s, s)
+              "FROM throughput WHERE ts>? AND ts<=?", start, end)[0]
+    p10 = rows("SELECT mbps FROM throughput WHERE ts>? AND ts<=? ORDER BY mbps LIMIT 1 OFFSET "
+               "(SELECT COUNT(*)/10 FROM throughput WHERE ts>? AND ts<=?)", start, end, start, end)
     t = "probes" if raw_ok(hours) else "probes_h"
-    loss = rows(f"SELECT AVG(loss) l, MAX(rtt_avg) r FROM {t} WHERE target='internet' AND ts>?", s)[0]
-    # worst days
+    loss = rows(f"SELECT AVG(loss) l, MAX(rtt_avg) r FROM {t} "
+                f"WHERE target='internet' AND ts>? AND ts<=?", start, end)[0]
     worst_speed = rows("SELECT date(ts,'unixepoch','localtime') d, AVG(mbps) m FROM throughput "
-                       "WHERE ts>? GROUP BY d ORDER BY m LIMIT 1", s)
+                       "WHERE ts>? AND ts<=? GROUP BY d ORDER BY m LIMIT 1", start, end)
     by_day: dict[str, int] = {}
     for i in inc:
         d = time.strftime("%Y-%m-%d", time.localtime(i["start"]))
         by_day[d] = by_day.get(d, 0) + i["duration"]
     worst_outage = max(by_day.items(), key=lambda kv: kv[1], default=None)
-    drops = rows("SELECT COUNT(*) n FROM wifi_drops WHERE ts>?", s)[0]["n"]
+    drops = rows("SELECT COUNT(*) n FROM wifi_drops WHERE ts>? AND ts<=?", start, end)[0]["n"]
     avg = sp["avg"]
     return {
-        "days": days, "covered_days": round(covered_s / 86400, 1),
+        "covered_days": round(covered_s / 86400, 1),
         "uptime_pct": round(100 * (1 - outage_s / covered_s), 3) if covered_s else None,
         "outages": len(inc), "outage_s": outage_s,
         "longest_s": max((i["duration"] for i in inc), default=0),
         "speed": {"avg": round(avg, 1) if avg else None, "min": sp["min"], "max": sp["max"],
                   "p10": p10[0]["mbps"] if p10 else None, "samples": sp["n"]},
-        "plan_mbps": PLAN_DOWN_MBPS or None,
         "pct_of_plan": round(100 * avg / PLAN_DOWN_MBPS, 1) if (avg and PLAN_DOWN_MBPS) else None,
         "loss_avg": round(loss["l"] or 0, 3), "rtt_max": loss["r"],
         "wifi_drops": drops,
@@ -1023,6 +1190,16 @@ async def report(days: int = Query(30, ge=1, le=RETENTION_DAYS)):
         "worst_outage_day": ({"date": worst_outage[0], "outage_s": worst_outage[1]}
                              if worst_outage else None),
     }
+
+
+@app.get("/api/report")
+async def report(days: int = Query(30, ge=1, le=RETENTION_DAYS)):
+    now = int(time.time())
+    cur = report_window(now - days * 86400, now)
+    prev = report_window(now - 2 * days * 86400, now - days * 86400)
+    return {"days": days, "plan_mbps": PLAN_DOWN_MBPS or None, **cur,
+            # Only offer a comparison when the previous window actually has data.
+            "previous": prev if prev["covered_days"] >= 0.5 else None}
 
 
 @app.get("/api/events")
@@ -1076,6 +1253,7 @@ async def devices():
         online[ip] = "SELF"
     rt = {d["mac"]: d for d in collector.router_devices_now}
     rt_by_ip = {d["ip"]: d for d in collector.router_devices_now if d["ip"]}
+    names = name_map()
     out = []
     for d in dev.get("devices", []):
         for ipinfo in d.get("ips", []):
@@ -1085,9 +1263,13 @@ async def devices():
             state = online.get(ip, "")
             mac = (d.get("hwaddr") or "").upper()
             r = rt.get(mac) or rt_by_ip.get(ip) or {}
+            nm = names.get(mac)
             out.append({
                 "ip": ip,
-                "name": ipinfo.get("name") or names_24h.get(ip) or r.get("name") or "",
+                "name": best_name(mac, r.get("name"), ipinfo.get("name"), names_24h.get(ip),
+                                  names=names),
+                "name_source": nm["source"] if nm else ("router" if r.get("name") else
+                                                        ("pihole" if ipinfo.get("name") else "")),
                 "mac": mac,
                 "vendor": d.get("macVendor") or "",
                 "queries_24h": queries_24h.get(ip, 0),

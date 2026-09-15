@@ -12,10 +12,14 @@ Built for a low-power always-on box (in my case an old laptop running Pi-hole an
 
 ![Incidents grouped with duration and cause, and the 30-day report: uptime, delivered vs plan, packet loss](docs/report.png)
 
+![Data used per device over 30 days, next to the raw event feed](docs/usage.png)
+
 <details>
-<summary>TV mode (1080p, sofa distance)</summary>
+<summary>TV mode (1080p, sofa distance) and phone</summary>
 
 ![TV mode](docs/tv-mode.png)
+
+<img src="docs/mobile.png" width="360" alt="Phone layout — verdict wraps, tiles go two-across, tables scroll inside their panels">
 </details>
 
 *Screenshots taken with `?demo=1`, which anonymises hostnames and MACs — see below.*
@@ -49,6 +53,18 @@ When the line is saturated the verdict names the device responsible: *"line satu
 **Last 30 days** — the numbers for the ISP conversation: uptime %, outage count and longest, **delivered vs plan** (set `PLAN_DOWN_MBPS`), slowest-10% speed, worst day, packet loss, WiFi disconnects. It only counts the time it was actually watching (`based on N days of data`), so a fresh install doesn't report a fictional month.
 
 **Click any device** in the Devices or WiFi tables to expand its last 24h: signal strength, download rate, and each disconnect drawn as a red bar whose height is the signal at the moment it dropped. `?device=AA:BB:CC:DD:EE:FF` deep-links straight to one. This is how you answer *"was the phone on weak signal during that call?"*
+
+**Device names, automatically.** Every 10 minutes each device with an IP gets a reverse mDNS lookup — Apple devices, Macs, Linux boxes and smart TVs answer with their real name (*Darrens iPhone*, *Living-Room-TV*). Anything that doesn't answer (IoT plugs, most Android) you can name yourself: hover a row, click the pencil, type, Enter. Manual names win over discovered ones and are never overwritten. Names flow into every panel, including the verdict: *"line saturated — Darrens iPhone alone is pulling 19."*
+
+**Data used** — approximate bytes per device over 30 days, from the router's per-client rate integrated over time. It's rate × interval, not a meter, so treat it as a ranking rather than a bill — but *"the TV used 41 GB"* explains a lot of buffering evenings.
+
+**Copy for ISP** — one button on the report builds a plain-text summary (uptime, outage list with timestamps, delivered vs plan, worst day) and puts it on the clipboard for the support chat.
+
+**Test now** — runs a speed test on demand from the throughput tile. Still refuses if the line is busy: a test that competes with a stream measures the wrong thing and ruins the stream.
+
+**vs last period** — every report tile carries a ▲/▼ against the previous 30 days once there's enough history, so you can tell whether fixing the mesh or phoning the ISP actually changed anything.
+
+**Sees its own absence.** If netdash finds a gap in its own probes on startup, it logs *"netdash stopped reporting — HTPC off, asleep or rebooted?"* as an incident; if the router's uptime counter goes backwards, it logs *"router rebooted."* Both are failures that previously left no trace at all.
 
 **History** — raw samples are kept 14 days; hourly rollups for 90. Every chart offers 6h / 24h / 7d / 30d / 90d and switches source automatically.
 
@@ -97,7 +113,7 @@ sudo systemctl enable --now netdash
 
 Then open `http://<host>:8080`. Edit `netdash.service` if your user isn't `darren` or you want a different port.
 
-Requirements on the host: `ping` (unprivileged ICMP — default on Ubuntu), `curl` ≥ 7.75 (for `%{exitcode}`), and `lm-sensors` for the fan reading (optional; shows `?` without it).
+Requirements on the host: `ping` (unprivileged ICMP — default on Ubuntu), `curl` ≥ 7.75 (for `%{exitcode}`), `avahi-utils` for automatic device names (optional; you can still name devices by hand), and `lm-sensors` for the fan reading (optional; shows `?` without it).
 
 ### Choosing which services to watch
 
@@ -150,6 +166,9 @@ Everything the page uses is plain JSON, handy for `curl` when something looks wr
 | `/api/incidents?hours=168` | Outages grouped with duration, LAN-vs-ISP attribution, which sources saw it, services that failed during it; plus a summary |
 | `/api/report?days=30` | Uptime, outages, speed avg/p10/worst day, delivered vs plan, loss, WiFi drops — clipped to the time actually covered |
 | `/api/router/signal?mac=…&hours=24` | One device's signal + rate points and its disconnects |
+| `/api/devices/usage?days=30` | Approximate GB down/up per device |
+| `PUT /api/devices/name` `{mac, name}` | Set a manual name (empty name clears it) |
+| `POST /api/speedtest` | Run a speed test now; `{skipped, reason}` if the line is busy |
 | `/api/wan?hours=24` | Probe timeseries (loss, rtt, jitter) per target |
 | `/api/throughput?hours=24` | Speed-test samples |
 | `/api/router/wan?hours=24` | Router WAN Mbps timeseries |
@@ -162,7 +181,7 @@ Everything the page uses is plain JSON, handy for `curl` when something looks wr
 
 ## Security notes
 
-- The page has **no authentication**. It's read-only network stats intended for a home LAN (and Tailscale). Don't expose port 8080 to the internet.
+- The page has **no authentication**. It's intended for a home LAN (and Tailscale). Don't expose port 8080 to the internet. The only things it can change are its own device names and running a speed test — nothing touches the router or Pi-hole.
 - `config.env` holds the Pi-hole and router passwords. It's gitignored and should be `chmod 600`. Nothing in the repo contains a secret.
 - Router access is read-only — `router.py` only ever issues GETs after login.
 
