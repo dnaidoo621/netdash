@@ -12,7 +12,9 @@ Built for a low-power always-on box (in my case an old laptop running Pi-hole an
 
 ![Incidents grouped with duration and cause, and the 30-day report: uptime, delivered vs plan, packet loss](docs/report.png)
 
-![Data used per device over 30 days, next to the raw event feed](docs/usage.png)
+![Day-by-hour heatmap of packet loss — makes time-of-day patterns obvious](docs/heatmap.png)
+
+![Exit-node relay traffic and data used per device over 30 days](docs/exitnode.png)
 
 <details>
 <summary>TV mode (1080p, sofa distance) and phone</summary>
@@ -65,6 +67,14 @@ When the line is saturated the verdict names the device responsible: *"line satu
 **vs last period** — every report tile carries a ▲/▼ against the previous 30 days once there's enough history, so you can tell whether fixing the mesh or phoning the ISP actually changed anything.
 
 **Sees its own absence.** If netdash finds a gap in its own probes on startup, it logs *"netdash stopped reporting — HTPC off, asleep or rebooted?"* as an incident; if the router's uptime counter goes backwards, it logs *"router rebooted."* Both are failures that previously left no trace at all.
+
+**When it goes wrong** — a day × hour heatmap of loss, latency or jitter. A 7-day line chart hides time-of-day patterns; a grid makes them obvious at a glance, and the caption names the worst hour. On my line it immediately surfaced a nightly 03:00 spike alongside the expected evening contention — two different problems that look identical in a summary figure.
+
+**Hung-process detection.** Processes are scored on *lifetime average* CPU, not instantaneous: a busy app peaks and settles, a hung one averages 60%+ for days. Anything over 40% for more than an hour appears on the host tile and in the verdict — *"stremio has averaged 64% CPU for 168h — likely hung."* Kernel threads and the compositor are excluded. This exists because a hung media player quietly ate a CPU core here for a week before anyone noticed.
+
+**New devices** — Pi-hole's first-seen data surfaced as events (*"iPhone joined the network at 192.168.10.54"*). The first run seeds silently, so only genuinely new arrivals appear.
+
+**Exit node** — if this box relays for a Tailscale tailnet, its traffic is tracked separately from ordinary LAN use: live in/out, GB relayed over the window, and per-peer totals when peers are active. Without it, relayed traffic shows up as mystery usage attributed to the host itself.
 
 **History** — raw samples are kept 14 days; hourly rollups for 90. Every chart offers 6h / 24h / 7d / 30d / 90d and switches source automatically.
 
@@ -169,6 +179,9 @@ Everything the page uses is plain JSON, handy for `curl` when something looks wr
 | `/api/devices/usage?days=30` | Approximate GB down/up per device |
 | `PUT /api/devices/name` `{mac, name}` | Set a manual name (empty name clears it) |
 | `POST /api/speedtest` | Run a speed test now; `{skipped, reason}` if the line is busy |
+| `/api/heatmap?days=7&metric=loss` | day × hour cells plus the worst hours (`loss` / `rtt` / `jitter`) |
+| `/api/hogs?hours=24` | Processes over the CPU threshold now, and any seen in the window |
+| `/api/tailscale?hours=24` | Exit-node relay traffic, GB over the window, per-peer totals |
 | `/api/wan?hours=24` | Probe timeseries (loss, rtt, jitter) per target |
 | `/api/throughput?hours=24` | Speed-test samples |
 | `/api/router/wan?hours=24` | Router WAN Mbps timeseries |

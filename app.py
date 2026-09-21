@@ -151,6 +151,15 @@ CREATE INDEX IF NOT EXISTS ix_services ON services(name, ts);
 CREATE TABLE IF NOT EXISTS service_seen (
     name TEXT PRIMARY KEY, last_seen INTEGER NOT NULL, queries INTEGER
 );
+CREATE TABLE IF NOT EXISTS ts_traffic (ts INTEGER PRIMARY KEY, rx_mbps REAL, tx_mbps REAL);
+CREATE TABLE IF NOT EXISTS ts_traffic_h (
+    ts INTEGER PRIMARY KEY, rx_mbps REAL, rx_max REAL, tx_mbps REAL, tx_max REAL
+);
+-- Long-running processes burning CPU: the hung-app detector.
+CREATE TABLE IF NOT EXISTS hogs (
+    ts INTEGER NOT NULL, pid INTEGER NOT NULL, comm TEXT, pct REAL, elapsed_s INTEGER,
+    PRIMARY KEY (ts, pid)
+);
 -- Friendly device names: manual overrides and mDNS discoveries.
 CREATE TABLE IF NOT EXISTS device_names (
     mac TEXT PRIMARY KEY, name TEXT NOT NULL, source TEXT NOT NULL, updated INTEGER NOT NULL
@@ -234,6 +243,10 @@ def rollup(backfill: bool = False):
             SELECT (ts/3600)*3600, mac, MIN(signal_db), AVG(signal_db), MAX(signal_db),
                    AVG(down_kbps), MAX(down_kbps), AVG(up_kbps), MAX(up_kbps)
             FROM router_devices WHERE ts >= ? AND ts < ? GROUP BY 1, 2""", (start, end))
+        conn.execute("""
+            INSERT OR REPLACE INTO ts_traffic_h
+            SELECT (ts/3600)*3600, AVG(rx_mbps), MAX(rx_mbps), AVG(tx_mbps), MAX(tx_mbps)
+            FROM ts_traffic WHERE ts >= ? AND ts < ? GROUP BY 1""", (start, end))
 
 
 def prune():
@@ -241,10 +254,11 @@ def prune():
     raw_cut = now - RAW_DAYS * 86400
     long_cut = now - RETENTION_DAYS * 86400
     with db() as conn:
-        for t in ("probes", "machine", "router_wan", "router_devices", "services"):
+        for t in ("probes", "machine", "router_wan", "router_devices", "services",
+                  "ts_traffic", "hogs"):
             conn.execute(f"DELETE FROM {t} WHERE ts < ?", (raw_cut,))
         for t in ("throughput", "events", "wifi_drops", "probes_h", "router_wan_h",
-                  "machine_h", "services_h", "router_devices_h"):
+                  "machine_h", "services_h", "router_devices_h", "ts_traffic_h"):
             conn.execute(f"DELETE FROM {t} WHERE ts < ?", (long_cut,))
 
 
@@ -387,6 +401,61 @@ def read_meminfo() -> tuple[int, int]:
     return avail, swap
 
 
+HOG_PCT = float(os.environ.get("HOG_PCT", "40"))
+HOG_MIN_S = int(os.environ.get("HOG_MIN_S", "3600"))
+# Kernel threads and things that are *meant* to use a lot of CPU over their lifetime.
+HOG_IGNORE = {"kthreadd", "ksoftirqd", "kswapd0", "khugepaged", "rcu_sched",
+              "migration", "systemd", "Xorg", "gnome-shell"}
+_CLK_TCK = os.sysconf("SC_CLK_TCK")
+
+
+def find_hogs() -> list[dict]:
+    """Processes whose *lifetime average* CPU is high — the signature of something hung
+    in a spin loop. A busy app peaks and settles; a hung one averages 60%+ for days.
+    This is what a week-long stremio (4.5 CPU-days in 7) or pop-upgrade looks like."""
+    now = time.time()
+    try:
+        boot = 0.0
+        for line in Path("/proc/stat").read_text().splitlines():
+            if line.startswith("btime "):
+                boot = float(line.split()[1])
+        if not boot:
+            return []
+    except OSError:
+        return []
+    out = []
+    for p in Path("/proc").iterdir():
+        if not p.name.isdigit():
+            continue
+        try:
+            stat = (p / "stat").read_text()
+            # comm can contain spaces/parens; fields after the final ')' are stable.
+            rp = stat.rindex(")")
+            comm = stat[stat.index("(") + 1:rp]
+            f = stat[rp + 2:].split()
+            utime, stime, starttime = int(f[11]), int(f[12]), int(f[19])
+        except (OSError, ValueError, IndexError):
+            continue
+        elapsed = now - (boot + starttime / _CLK_TCK)
+        if elapsed < HOG_MIN_S or comm in HOG_IGNORE:
+            continue
+        pct = 100 * ((utime + stime) / _CLK_TCK) / elapsed
+        if pct >= HOG_PCT:
+            out.append({"pid": int(p.name), "comm": comm, "pct": round(pct, 1),
+                        "elapsed_s": int(elapsed)})
+    out.sort(key=lambda x: -x["pct"])
+    return out[:5]
+
+
+def read_ts_bytes() -> tuple[int, int] | None:
+    base = Path("/sys/class/net/tailscale0/statistics")
+    try:
+        return (int((base / "rx_bytes").read_text()),
+                int((base / "tx_bytes").read_text()))
+    except OSError:
+        return None
+
+
 def read_nic_bytes() -> tuple[int, int]:
     base = Path(f"/sys/class/net/{IFACE}/statistics")
     try:
@@ -410,6 +479,36 @@ class Collector:
         # [{"name","url","source":"pinned"|"auto","queries"}] — rebuilt by detect_services()
         self.services_active: list[dict] = []
         self.router_uptime_s: int | None = None
+        self.last_ts: tuple[int, int, float] | None = None
+        self.hogs_now: list[dict] = []
+        self.hog_reported: dict[int, float] = {}
+        self.known_devices: set[str] = set()
+
+    # -------------------------------------------------- new devices --
+    async def new_devices_cycle(self):
+        """Surface devices Pi-hole has seen for the first time. The first run seeds the
+        known set silently — otherwise every existing device would look 'new'."""
+        ph = await pihole.safe("/api/network/devices",
+                               {"max_devices": 200, "max_addresses": 2})
+        devs = ph.get("devices") if isinstance(ph, dict) else None
+        if not devs:
+            return
+        seeding = not self.known_devices
+        names = name_map()
+        for d in devs:
+            mac = (d.get("hwaddr") or "").upper()
+            if not re.fullmatch(r"[0-9A-F]{2}(:[0-9A-F]{2}){5}", mac) or mac in self.known_devices:
+                continue
+            self.known_devices.add(mac)
+            if seeding:
+                continue
+            first = d.get("firstSeen") or int(time.time())
+            ip = next((i.get("ip") for i in d.get("ips", []) if i.get("ip")), "")
+            label = best_name(mac, d.get("macVendor"), names=names) or mac
+            with db() as conn:
+                conn.execute("INSERT INTO events(ts,kind,detail) VALUES (?,?,?)",
+                             (first, "new_device", f"{label} joined the network"
+                                                   f"{' at ' + ip if ip else ''} [{mac}]"))
 
     # -------------------------------------------------------- names --
     async def names_cycle(self):
@@ -633,6 +732,32 @@ class Collector:
                 (int(ts), load1, read_pkg_temp(), await read_fan(),
                  avail, swap, rx_mbps, tx_mbps),
             )
+        # Tailscale exit-node traffic (this box relays for the tailnet).
+        tsb = read_ts_bytes()
+        if tsb:
+            prev = self.last_ts
+            self.last_ts = (*tsb, ts)
+            if prev and ts > prev[2]:
+                r = (tsb[0] - prev[0]) * 8 / (ts - prev[2]) / 1_000_000
+                t = (tsb[1] - prev[1]) * 8 / (ts - prev[2]) / 1_000_000
+                if r >= 0 and t >= 0:          # counter reset guard
+                    with db() as conn:
+                        conn.execute("INSERT OR REPLACE INTO ts_traffic VALUES (?,?,?)",
+                                     (int(ts), round(r, 3), round(t, 3)))
+        # Hung-process detection.
+        hogs = find_hogs()
+        self.hogs_now = hogs
+        if hogs:
+            with db() as conn:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO hogs VALUES (?,?,?,?,?)",
+                    [(int(ts), h["pid"], h["comm"], h["pct"], h["elapsed_s"]) for h in hogs])
+            top = hogs[0]
+            # One event per pid per 6h, so a long-running hog doesn't spam the feed.
+            if self.hog_reported.get(top["pid"], 0) < ts - 6 * 3600:
+                self.hog_reported[top["pid"]] = ts
+                add_event("cpu_hog", f"{top['comm']} has averaged {top['pct']:.0f}% CPU for "
+                                     f"{top['elapsed_s'] // 3600}h — hung?")
 
     async def throughput_cycle(self):
         # Skip if the line is busy so we don't stomp on a stream and misreport.
@@ -663,7 +788,9 @@ class Collector:
         next_svc = 0.0
         next_detect = 0.0
         next_names = time.time() + 90      # after the first router poll has populated IPs
+        next_newdev = 0.0
         next_prune = time.time() + 3600
+        self.last_ts = (*(read_ts_bytes() or (0, 0)), time.time()) if read_ts_bytes() else None
         while True:
             started = time.time()
             try:
@@ -684,6 +811,9 @@ class Collector:
                 if started >= next_names:
                     next_names = started + 600
                     asyncio.create_task(self.names_cycle())
+                if started >= next_newdev:
+                    next_newdev = started + 300
+                    asyncio.create_task(self.new_devices_cycle())
                 if started >= next_prune:
                     next_prune = started + 3600
                     rollup()
@@ -793,7 +923,8 @@ async def overview():
                 router.logged_in and not router.last_error,
                 line_used=rw[0]["rx_mbps"] if rw else None,
                 line_cap=tp[0]["mbps"] if tp else None,
-                hog_mbps=hog_mbps)
+                hog_mbps=hog_mbps,
+                cpu_hog=collector.hogs_now[0] if collector.hogs_now else None)
     if "{hog}" in v["text"] and hog:
         v["hog"] = {"name": best_name(hog.get("mac", ""), hog.get("name")), "mac": hog.get("mac"),
                     "ip": hog.get("ip"), "mbps": round(hog_mbps or 0, 1)}
@@ -810,6 +941,7 @@ async def overview():
         "day": agg[0] if agg else {},
         "pihole": summary,
         "targets": TARGETS,
+        "hogs": collector.hogs_now[:3],
         "router": {
             "configured": bool(ROUTER_PASSWORD),
             "ok": router.logged_in and not router.last_error,
@@ -928,7 +1060,7 @@ def build_incidents(hours: float) -> list[dict]:
 def verdict(internet_up: bool, inet_loss: float, gw_loss: float,
             svcs: list[dict], wifi_weak: int, pihole_ok: bool, router_ok: bool,
             line_used: float | None = None, line_cap: float | None = None,
-            hog_mbps: float | None = None) -> dict:
+            hog_mbps: float | None = None, cpu_hog: dict | None = None) -> dict:
     """One sentence that says whose problem it is. "{hog}" is filled in by the client so
     demo mode can anonymise the device name."""
     if not internet_up:
@@ -969,6 +1101,9 @@ def verdict(internet_up: bool, inet_loss: float, gw_loss: float,
         parts.append("Pi-hole API unreachable"); level = "warn"
     if ROUTER_PASSWORD and not router_ok:
         parts.append("router not reachable"); level = "warn"
+    if cpu_hog:
+        parts.append(f"{cpu_hog['comm']} has averaged {cpu_hog['pct']:.0f}% CPU for "
+                     f"{cpu_hog['elapsed_s'] // 3600}h — likely hung"); level = "warn"
     if not parts:
         return {"level": "ok", "text": "Everything looks healthy"}
     return {"level": level, "text": " · ".join(parts)}
@@ -990,6 +1125,82 @@ async def incidents(hours: float = Query(168, ge=1, le=MAX_HOURS)):
             "summary": {"count": len(inc), "total_s": total,
                         "longest_s": max((i["duration"] for i in inc), default=0),
                         "uptime_pct": round(100 * (1 - total / (hours * 3600)), 3)}}
+
+
+@app.get("/api/heatmap")
+async def heatmap(days: int = Query(7, ge=1, le=30), metric: str = Query("loss")):
+    """day x hour grid of loss / latency / jitter — makes time-of-day patterns obvious
+    in a way a 7-day line chart never does."""
+    col = {"loss": "loss", "rtt": "rtt_avg", "jitter": "jitter"}.get(metric, "loss")
+    s = since(days * 24)
+    # Hourly rollups cover the whole window once the first hour has rolled up; for the
+    # current (incomplete) hour, fall back to raw so today's last cell isn't blank.
+    rows_h = rows(f"SELECT ts, {col} v FROM probes_h WHERE target='internet' AND ts>?", s)
+    rows_r = rows(f"SELECT (ts/3600)*3600 ts, AVG({col}) v FROM probes "
+                  f"WHERE target='internet' AND ts>? GROUP BY 1", max(s, int(time.time()) - 7200))
+    cells: dict[int, float] = {r["ts"]: r["v"] for r in rows_h if r["v"] is not None}
+    cells.update({r["ts"]: r["v"] for r in rows_r if r["v"] is not None})
+    grid = []
+    for ts, v in sorted(cells.items()):
+        lt = time.localtime(ts)
+        grid.append({"ts": ts, "date": time.strftime("%Y-%m-%d", lt),
+                     "hour": lt.tm_hour, "v": round(v, 3)})
+    vals = [g["v"] for g in grid]
+    return {"metric": metric, "days": days, "cells": grid,
+            "max": max(vals) if vals else 0,
+            "worst_hours": sorted(
+                ({"hour": h, "avg": round(sum(x) / len(x), 3), "n": len(x)}
+                 for h, x in _by_hour(grid).items()),
+                key=lambda x: -x["avg"])[:3]}
+
+
+def _by_hour(grid: list[dict]) -> dict[int, list]:
+    out: dict[int, list] = {}
+    for g in grid:
+        out.setdefault(g["hour"], []).append(g["v"])
+    return out
+
+
+@app.get("/api/hogs")
+async def hogs(hours: float = Query(24, ge=1, le=MAX_HOURS)):
+    """Processes burning CPU now, plus any seen in the window."""
+    seen = rows("SELECT comm, MAX(pct) pct, MAX(elapsed_s) elapsed_s, MAX(ts) last_ts, "
+                "COUNT(DISTINCT pid) pids FROM hogs WHERE ts>? GROUP BY comm "
+                "ORDER BY pct DESC LIMIT 8", since(hours))
+    return {"now": collector.hogs_now, "seen": seen,
+            "threshold_pct": HOG_PCT, "min_age_s": HOG_MIN_S}
+
+
+@app.get("/api/tailscale")
+async def tailscale(hours: float = Query(24, ge=1, le=MAX_HOURS)):
+    """Exit-node relay traffic. rx = from the tailnet, tx = back to it."""
+    t = "ts_traffic" if raw_ok(hours) else "ts_traffic_h"
+    series = rows(f"SELECT ts,rx_mbps,tx_mbps FROM {t} WHERE ts>? ORDER BY ts", since(hours))
+    latest = rows("SELECT * FROM ts_traffic ORDER BY ts DESC LIMIT 1")
+    tot = read_ts_bytes()
+    # Integrate the samples for GB over the window (60s apart raw, 3600s hourly).
+    step = 60 if raw_ok(hours) else 3600
+    gb_in = sum((r["rx_mbps"] or 0) for r in series) * step / 8 / 1000
+    gb_out = sum((r["tx_mbps"] or 0) for r in series) * step / 8 / 1000
+    peers = []
+    try:
+        out = await run(["tailscale", "status", "--json"], timeout=8)
+        import json as _json
+        d = _json.loads(out)
+        for p in (d.get("Peer") or {}).values():
+            if p.get("TxBytes") or p.get("RxBytes"):
+                peers.append({"name": p.get("HostName"), "online": bool(p.get("Online")),
+                              "gb_to_peer": round((p.get("TxBytes") or 0) / 1e9, 2),
+                              "gb_from_peer": round((p.get("RxBytes") or 0) / 1e9, 2)})
+        peers.sort(key=lambda x: -(x["gb_to_peer"] + x["gb_from_peer"]))
+    except Exception:
+        pass
+    return {"available": tot is not None,
+            "now": latest[0] if latest else None,
+            "window_gb_in": round(gb_in, 2), "window_gb_out": round(gb_out, 2),
+            "total_gb_out": round(tot[1] / 1e9, 2) if tot else None,
+            "total_gb_in": round(tot[0] / 1e9, 2) if tot else None,
+            "series": series, "peers": peers[:8]}
 
 
 @app.get("/api/router/wan")

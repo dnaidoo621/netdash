@@ -76,7 +76,7 @@
   .list .t{color:var(--muted);font-variant-numeric:tabular-nums;font-size:12px;flex:0 0 118px}
   .list .k{font-weight:600;flex:0 0 auto}
   .list .d{color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .k.internet_down,.k.wan_offline,.k.host_down{color:var(--bad)}.k.internet_up,.k.wan_online,.k.host_up{color:var(--ok)}.k.packet_loss,.k.router_reboot{color:var(--warn)}
+  .k.internet_down,.k.wan_offline,.k.host_down{color:var(--bad)}.k.internet_up,.k.wan_online,.k.host_up{color:var(--ok)}.k.packet_loss,.k.router_reboot,.k.cpu_hog{color:var(--warn)}.k.new_device{color:var(--acc2)}
   .k.CONNECTION_ERROR,.k.collector_error{color:var(--warn)}
   .range{display:inline-flex;gap:4px}
   .range button{background:var(--panel2);color:var(--dim);border:1px solid var(--line);
@@ -240,9 +240,23 @@
     </div>
 
     <div class="panel wide">
+      <h2>When it goes wrong
+        <span class="r range" id="hm-metric">
+          <button data-m="loss" class="on">loss</button><button data-m="rtt">latency</button><button data-m="jitter">jitter</button>
+        </span>
+        <span class="r" id="hm-note" style="margin-right:10px">last 7 days by hour</span></h2>
+      <div class="scroll"><div id="heatmap"></div></div>
+    </div>
+
+    <div class="panel wide">
       <h2>Last 30 days <span class="r" id="rep-note">what your ISP actually delivered</span>
         <button class="btn" id="copy-isp" style="margin-left:10px" title="copy a plain-text summary for your ISP">copy for ISP</button></h2>
       <div class="grid tiles" id="report"></div>
+    </div>
+
+    <div class="panel tv-hide">
+      <h2>Exit node <span class="r" id="ts-note">Tailscale relay traffic</span></h2>
+      <div id="tailscale"></div>
     </div>
 
     <div class="panel">
@@ -429,7 +443,10 @@ async function loadOverview(){
   if(m){
     const tc = m.pkg_temp==null?'':m.pkg_temp<70?'ok':m.pkg_temp<80?'warn':'bad';
     $('#t-mc').innerHTML = '<span class="'+tc+'">'+num(m.pkg_temp,0)+'°C</span>';
-    $('#t-mc-s').textContent = 'load '+num(m.load1,2)+' · fan '+(m.fan??'—')+' rpm · '+Math.round((m.mem_avail_mb||0)/1024*10)/10+' GB free'; }
+    const hg = (o.hogs||[])[0];
+    $('#t-mc-s').innerHTML = hg
+      ? '<span class="warn">'+esc(hg.comm)+' '+Math.round(hg.pct)+'% for '+Math.round(hg.elapsed_s/3600)+'h</span> · load '+num(m.load1,2)+' · '+Math.round((m.mem_avail_mb||0)/1024*10)/10+' GB free'
+      : 'load '+num(m.load1,2)+' · fan '+(m.fan??'—')+' rpm · '+Math.round((m.mem_avail_mb||0)/1024*10)/10+' GB free'; }
   const p=o.pihole||{};
   if(p.queries){ const q=p.queries; $('#t-blk').textContent=num(q.percent_blocked,1)+'%'; $('#t-blk').className='v acc';
     $('#t-blk-s').textContent = q.blocked.toLocaleString()+' of '+q.total.toLocaleString()+' · '+(p.clients?.active??'—')+' clients active'; }
@@ -634,6 +651,74 @@ async function loadReport(){
   tile('Packet loss', num(r.loss_avg,2)+'%', 'to 1.1.1.1 · max rtt '+num(r.rtt_max,0)+' ms', r.loss_avg<0.5?'ok':r.loss_avg<3?'warn':'bad', p?delta(r.loss_avg,p.loss_avg,false,pct1):'');
   tile('WiFi disconnects', r.wifi_drops.toLocaleString(), 'logged by the router', r.wifi_drops>200?'warn':'', p?delta(r.wifi_drops,p.wifi_drops,false,n0):'');
 }
+// ------------------------------------------------------------- heatmap ---
+// day x hour grid. Colour by value against the window max, so a quiet week stays
+// readable — the label under it always states the real scale.
+let hmMetric = 'loss';
+async function loadHeatmap(){
+  const d = await j('/api/heatmap?days=7&metric='+hmMetric);
+  const el = $('#heatmap');
+  if(!d.cells.length){ el.innerHTML='<div class="empty">not enough history yet</div>'; return; }
+  const unit = hmMetric==='loss' ? '%' : ' ms';
+  const days = [...new Set(d.cells.map(c=>c.date))].sort();
+  const by = {}; for(const c of d.cells) by[c.date+'|'+c.hour] = c.v;
+  const max = Math.max(d.max, hmMetric==='loss' ? 1 : 10);
+  const colour = v => { if(v==null) return 'background:var(--panel2)';
+    const t = Math.min(1, v/max);
+    if(t<0.02) return 'background:rgba(63,185,80,.25)';
+    const hue = 45 - 45*Math.min(1,(t-0.02)/0.6);      // amber -> red
+    return 'background:hsl('+hue+',85%,'+(30+22*Math.min(1,t*1.5))+'%)'; };
+  // Fixed layout with an explicit width, or the day-label column soaks up the slack
+  // and pushes the grid to the right.
+  const LBL = 46, CELL = 20, GAP = 2;
+  const tw = LBL + 24 * (CELL + GAP) + GAP;
+  let html = '<table style="border-collapse:separate;border-spacing:'+GAP+'px;font-size:11px;'
+    + 'table-layout:fixed;width:'+tw+'px"><thead><tr><th style="width:'+LBL+'px"></th>';
+  for(let h=0;h<24;h++) html += '<th style="width:'+CELL+'px;color:var(--muted);font-weight:400;padding:0;text-align:left">'+(h%3===0?String(h).padStart(2,'0'):'')+'</th>';
+  html += '</tr></thead><tbody>';
+  for(const date of days){
+    const lbl = new Date(date+'T12:00').toLocaleDateString([], {weekday:'short'});
+    html += '<tr><td style="width:'+LBL+'px;color:var(--dim);white-space:nowrap">'+lbl+'</td>';
+    for(let h=0;h<24;h++){
+      const v = by[date+'|'+h];
+      const title = date+' '+String(h).padStart(2,'0')+':00 — '+(v==null?'no data':num(v,2)+unit);
+      html += '<td style="height:18px;border-radius:3px;'+colour(v)+'" title="'+title+'"></td>';
+    }
+    html += '</tr>';
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+  const w = d.worst_hours[0];
+  $('#hm-note').textContent = 'last 7 days by hour · peak '+num(d.max,2)+unit
+    + (w ? ' · worst hour '+String(w.hour).padStart(2,'0')+':00 ('+num(w.avg,2)+unit+' avg)' : '');
+}
+$('#hm-metric').addEventListener('click', e=>{ const b=e.target.closest('button'); if(!b) return;
+  hmMetric=b.dataset.m; [...e.currentTarget.children].forEach(x=>x.classList.toggle('on',x===b)); loadHeatmap(); });
+
+// ---------------------------------------------------------- exit node ---
+async function loadTailscale(){
+  const t = await j('/api/tailscale?hours=24'); const el=$('#tailscale');
+  if(!t.available){ el.innerHTML='<div class="empty">tailscale0 not present</div>'; $('#ts-note').textContent='not running'; return; }
+  $('#ts-note').textContent = 'Tailscale relay traffic · '+num(t.total_gb_out,1)+' GB relayed since the daemon started';
+  const now = t.now || {rx_mbps:0, tx_mbps:0};
+  let html = '<div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:10px">'
+    + '<div><div class="s">now</div><div class="v" style="font-size:20px">'+num(now.rx_mbps,1)+' / '+num(now.tx_mbps,1)+'</div><div class="s">in / out Mbps</div></div>'
+    + '<div><div class="s">last 24h</div><div class="v acc" style="font-size:20px">'+num(t.window_gb_out,2)+' GB</div><div class="s">relayed out to peers</div></div>'
+    + '</div>';
+  if(t.peers.length){
+    html += '<table><thead><tr><th>Peer</th><th class="num">To peer</th><th class="num">From peer</th></tr></thead><tbody>';
+    for(const p of t.peers){
+      const nm = DEMO ? 'Peer '+(t.peers.indexOf(p)+1) : esc(p.name||'—');
+      html += '<tr><td><span class="dot '+(p.online?'on':'')+'"></span>'+nm+'</td>'
+        + '<td class="num">'+num(p.gb_to_peer,2)+' GB</td><td class="num" style="color:var(--dim)">'+num(p.gb_from_peer,2)+' GB</td></tr>';
+    }
+    html += '</tbody></table>';
+  } else {
+    html += '<div style="color:var(--muted);font-size:12px">no per-peer counters yet — they populate while a peer is actively relaying</div>';
+  }
+  el.innerHTML = html;
+}
+
 async function loadUsage(){
   const u = await j('/api/devices/usage?days=30'); const tb=$('#usage tbody'); tb.innerHTML='';
   $('#usage-note').textContent = '30 days · '+num(u.total_gb,1)+' GB total · approximate (rate × time)';
@@ -689,13 +774,15 @@ async function loadEvents(){
   const ul=$('#events'); ul.innerHTML='';
   if(!items.length){ ul.innerHTML='<li class="empty">no events in the last 7 days</li>'; return; }
   for(const it of items.slice(0,40)){ const li=document.createElement('li');
-    li.innerHTML='<span class="t">'+fmtDT(it.ts)+'</span><span class="k '+it.kind+'">'+it.kind.replace(/_/g,' ')+'</span><span class="d" title="'+it.text+'">'+it.text+'</span>';
+    // new_device carries a hostname and MAC — mask both for screenshots.
+    const txt = (DEMO && it.kind==='new_device') ? 'a new device joined the network' : it.text;
+    li.innerHTML='<span class="t">'+fmtDT(it.ts)+'</span><span class="k '+esc(it.kind)+'">'+esc(it.kind.replace(/_/g,' '))+'</span><span class="d" title="'+esc(txt)+'">'+esc(txt)+'</span>';
     ul.appendChild(li); }
 }
 
 // -------------------------------------------------------------- refresh ---
 async function refresh(){
-  const tasks=[loadOverview(), loadServices(), loadWan(), loadThroughput(), loadMachine(), loadPihole(), loadDevices(), loadWifi(), loadIncidents(), loadReport(), loadUsage(), loadEvents()];
+  const tasks=[loadOverview(), loadServices(), loadWan(), loadThroughput(), loadMachine(), loadPihole(), loadDevices(), loadWifi(), loadIncidents(), loadReport(), loadHeatmap(), loadTailscale(), loadUsage(), loadEvents()];
   const res = await Promise.allSettled(tasks);
   const failed = res.filter(r=>r.status==='rejected');
   if(failed.length){ console.warn(failed.map(f=>f.reason)); $('#updated').textContent += ' · '+failed.length+' panel(s) failed'; }
