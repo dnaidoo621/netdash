@@ -9,6 +9,7 @@ is precisely when you'll be looking at it.
 import asyncio
 import os
 import re
+import shlex
 import sqlite3
 import time
 from contextlib import asynccontextmanager
@@ -44,6 +45,12 @@ RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "90"))
 MAX_HOURS = RETENTION_DAYS * 24
 # What you pay for. Set it and the throughput tile and monthly report say "x% of plan".
 PLAN_DOWN_MBPS = float(os.environ.get("PLAN_DOWN_MBPS", "0") or 0)
+PLAN_UP_MBPS = float(os.environ.get("PLAN_UP_MBPS", "0") or 0)
+# Upload testing is off unless asked for: on an asymmetric line it measures little and
+# saturates the uplink, which hurts every other connection in the house.
+UPLOAD_TEST = os.environ.get("UPLOAD_TEST", "0").lower() in ("1", "true", "yes")
+UPLOAD_URL = os.environ.get("UPLOAD_URL", "https://speed.cloudflare.com/__up")
+UPLOAD_BYTES = int(os.environ.get("UPLOAD_BYTES", "25000000"))
 ROUTER_URL = os.environ.get("ROUTER_URL", f"http://{GATEWAY}")
 ROUTER_PASSWORD = os.environ.get("ROUTER_PASSWORD", "")
 ROUTER_WAN_IFACE = os.environ.get("ROUTER_WAN_IFACE", "eth1.2")
@@ -198,6 +205,11 @@ def db():
 def init_db():
     with db() as conn:
         conn.executescript(SCHEMA)
+        # Migrations for databases created before a column existed. Adding a column is
+        # cheap and keeps old rows (they read back as NULL, which the UI renders as "—").
+        have = {r["name"] for r in conn.execute("PRAGMA table_info(throughput)")}
+        if "up_mbps" not in have:
+            conn.execute("ALTER TABLE throughput ADD COLUMN up_mbps REAL")
 
 
 def add_event(kind: str, detail: str):
@@ -313,6 +325,29 @@ async def throughput_mbps() -> float | None:
     )
     try:
         bps = float(out.strip())
+    except ValueError:
+        return None
+    return round(bps * 8 / 1_000_000, 1) if bps > 0 else None
+
+
+async def upload_mbps() -> float | None:
+    """Upload test. Only worth running on a symmetric line — on an asymmetric one it
+    mostly measures the (tiny) uplink and risks starving it, so UPLOAD_TEST gates it."""
+    size = UPLOAD_BYTES
+    # Stream zeros straight into curl rather than writing a temp file.
+    proc = await asyncio.create_subprocess_shell(
+        f"head -c {size} /dev/zero | curl -o /dev/null -s --max-time 40 "
+        f"-X POST -H 'Content-Type: application/octet-stream' "
+        f"--data-binary @- -w '%{{speed_upload}}' {shlex.quote(UPLOAD_URL)}",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), 50)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return None
+    try:
+        bps = float(out.decode().strip())
     except ValueError:
         return None
     return round(bps * 8 / 1_000_000, 1) if bps > 0 else None
@@ -760,17 +795,21 @@ class Collector:
                                      f"{top['elapsed_s'] // 3600}h — hung?")
 
     async def throughput_cycle(self):
-        # Skip if the line is busy so we don't stomp on a stream and misreport.
-        rx_now, _ = read_nic_bytes()
+        # Skip if the line is busy so we don't stomp on a stream and misreport. Checks
+        # both directions now that upload is worth measuring.
+        rx_now, tx_now = read_nic_bytes()
         await asyncio.sleep(3)
-        rx_later, _ = read_nic_bytes()
-        if (rx_later - rx_now) * 8 / 3 / 1_000_000 > 3:
+        rx_later, tx_later = read_nic_bytes()
+        busy_d = (rx_later - rx_now) * 8 / 3 / 1_000_000
+        busy_u = (tx_later - tx_now) * 8 / 3 / 1_000_000
+        if busy_d > 3 or busy_u > 3:
             return
         mbps = await throughput_mbps()
-        if mbps is not None:
+        up = await upload_mbps() if UPLOAD_TEST else None
+        if mbps is not None or up is not None:
             with db() as conn:
-                conn.execute("INSERT INTO throughput VALUES (?,?)",
-                             (int(time.time()), mbps))
+                conn.execute("INSERT INTO throughput(ts, mbps, up_mbps) VALUES (?,?,?)",
+                             (int(time.time()), mbps, up))
 
     async def loop(self):
         try:
@@ -933,6 +972,7 @@ async def overview():
         "internet_up": internet_up,
         "verdict": v,
         "plan_mbps": PLAN_DOWN_MBPS or None,
+        "plan_up_mbps": PLAN_UP_MBPS or None,
         "services": {"up": sum(1 for s in svcs if s["ok"]), "total": len(svcs),
                      "down": [s["name"] for s in svcs if s["down"]]},
         "latest": latest,
@@ -1311,11 +1351,13 @@ async def speedtest_now():
     if busy > 3 or line_busy > 3:
         return {"skipped": True, "reason": f"line busy ({max(busy, line_busy):.0f} Mbps in use)"}
     mbps = await throughput_mbps()
-    if mbps is None:
+    up = await upload_mbps() if UPLOAD_TEST else None
+    if mbps is None and up is None:
         return {"skipped": True, "reason": "test failed"}
     with db() as conn:
-        conn.execute("INSERT INTO throughput VALUES (?,?)", (int(time.time()), mbps))
-    return {"skipped": False, "mbps": mbps}
+        conn.execute("INSERT INTO throughput(ts, mbps, up_mbps) VALUES (?,?,?)",
+                     (int(time.time()), mbps, up))
+    return {"skipped": False, "mbps": mbps, "up_mbps": up}
 
 
 @app.get("/api/router/signal")
@@ -1344,7 +1386,7 @@ async def wan(hours: float = Query(24, ge=1, le=MAX_HOURS)):
 
 @app.get("/api/throughput")
 async def throughput(hours: float = Query(24, ge=1, le=MAX_HOURS)):
-    return rows("SELECT ts,mbps FROM throughput WHERE ts>? ORDER BY ts",
+    return rows("SELECT ts,mbps,up_mbps FROM throughput WHERE ts>? ORDER BY ts",
                 since(hours))
 
 
@@ -1385,7 +1427,13 @@ def report_window(start: int, end: int) -> dict:
         by_day[d] = by_day.get(d, 0) + i["duration"]
     worst_outage = max(by_day.items(), key=lambda kv: kv[1], default=None)
     drops = rows("SELECT COUNT(*) n FROM wifi_drops WHERE ts>? AND ts<=?", start, end)[0]["n"]
+    up = rows("SELECT AVG(up_mbps) avg, MIN(up_mbps) min, MAX(up_mbps) max, "
+              "COUNT(up_mbps) n FROM throughput WHERE ts>? AND ts<=?", start, end)[0]
+    up_p10 = rows("SELECT up_mbps FROM throughput WHERE ts>? AND ts<=? AND up_mbps IS NOT NULL "
+                  "ORDER BY up_mbps LIMIT 1 OFFSET (SELECT COUNT(up_mbps)/10 FROM throughput "
+                  "WHERE ts>? AND ts<=?)", start, end, start, end)
     avg = sp["avg"]
+    uavg = up["avg"]
     return {
         "covered_days": round(covered_s / 86400, 1),
         "uptime_pct": round(100 * (1 - outage_s / covered_s), 3) if covered_s else None,
@@ -1393,7 +1441,11 @@ def report_window(start: int, end: int) -> dict:
         "longest_s": max((i["duration"] for i in inc), default=0),
         "speed": {"avg": round(avg, 1) if avg else None, "min": sp["min"], "max": sp["max"],
                   "p10": p10[0]["mbps"] if p10 else None, "samples": sp["n"]},
+        "upload": {"avg": round(uavg, 1) if uavg else None, "min": up["min"], "max": up["max"],
+                   "p10": up_p10[0]["up_mbps"] if up_p10 else None, "samples": up["n"]},
         "pct_of_plan": round(100 * avg / PLAN_DOWN_MBPS, 1) if (avg and PLAN_DOWN_MBPS) else None,
+        "up_pct_of_plan": round(100 * uavg / PLAN_UP_MBPS, 1) if (uavg and PLAN_UP_MBPS) else None,
+        "plan_up_mbps": PLAN_UP_MBPS or None,
         "loss_avg": round(loss["l"] or 0, 3), "rtt_max": loss["r"],
         "wifi_drops": drops,
         "worst_speed_day": ({"date": worst_speed[0]["d"], "mbps": round(worst_speed[0]["m"], 1)}

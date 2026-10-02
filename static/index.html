@@ -189,7 +189,8 @@
       <div class="legend">
         <span><i style="background:var(--acc)"></i>download (whole house)</span>
         <span><i style="background:var(--acc2)"></i>upload</span>
-        <span><i style="background:var(--ok)"></i>speed test</span>
+        <span><i style="background:var(--ok)"></i>speed test (down)</span>
+        <span id="tp-legend-up" hidden><i style="background:var(--warn)"></i>speed test (up)</span>
       </div>
     </div>
 
@@ -420,10 +421,16 @@ async function loadOverview(){
   const d=o.day||{}; const loss=d.loss??0;
   $('#t-loss').textContent = num(loss,2)+'%'; $('#t-loss').className='v '+(loss<0.5?'ok':loss<3?'warn':'bad');
   $('#t-loss-s').textContent = (d.outages||0)+' outage probe'+((d.outages||0)===1?'':'s')+' · max rtt '+num(d.rtt_max,0)+' ms';
-  if(o.throughput){ const mb=o.throughput.mbps, plan=o.plan_mbps; $('#t-tp').textContent = num(mb,0)+' Mbps';
-    const pct = plan ? Math.round(100*mb/plan) : null;
-    $('#t-tp').className='v '+(pct==null?'acc':pct>=85?'ok':pct>=60?'warn':'bad');
-    $('#t-tp-s').textContent = (pct!=null ? pct+'% of your '+num(plan,0)+' Mbps plan · ' : '')+'measured '+ago(o.throughput.ts); }
+  if(o.throughput){ const mb=o.throughput.mbps, up=o.throughput.up_mbps, plan=o.plan_mbps, uplan=o.plan_up_mbps;
+    $('#t-tp').textContent = (mb==null?'—':num(mb,0)) + (up!=null ? ' / '+num(up,0) : '') + ' Mbps';
+    // Colour on the worse of the two directions — a good download hides a bad upload.
+    const pct = plan&&mb!=null ? Math.round(100*mb/plan) : null;
+    const upct = uplan&&up!=null ? Math.round(100*up/uplan) : null;
+    const worst = [pct,upct].filter(x=>x!=null).sort((a,b)=>a-b)[0] ?? null;
+    $('#t-tp').className='v '+(worst==null?'acc':worst>=85?'ok':worst>=60?'warn':'bad');
+    const planTxt = (pct!=null&&upct!=null) ? pct+'% / '+upct+'% of your '+num(plan,0)+'/'+num(uplan,0)+' plan · '
+                  : (pct!=null ? pct+'% of your '+num(plan,0)+' Mbps plan · ' : '');
+    $('#t-tp-s').textContent = planTxt + (up!=null?'down / up · ':'') + 'measured '+ago(o.throughput.ts); }
   else { $('#t-tp').textContent='—'; $('#t-tp-s').textContent='first sample within 15 min'; }
   const m=o.machine, rt=o.router||{};
   // Line usage: prefer the router's WAN counters (whole house); fall back to this box's NIC.
@@ -469,12 +476,16 @@ async function loadWan(){
 async function loadThroughput(){
   const [t, rw] = await Promise.all([j('/api/throughput?hours='+wanHours), j('/api/router/wan?hours='+wanHours)]);
   const now=Math.floor(Date.now()/1000);
-  const top = Math.max(25, ...t.map(p=>p.mbps), ...rw.map(p=>p.rx_mbps))*1.1;
+  const vals = [...t.map(p=>p.mbps), ...t.map(p=>p.up_mbps), ...rw.map(p=>p.rx_mbps)].filter(v=>v!=null);
+  const top = Math.max(25, ...vals)*1.1;
+  const hasUp = t.some(p=>p.up_mbps!=null);
   chart($('#c-tp'), [
     {pts:rw.map(p=>[p.ts,p.rx_mbps]), color:css('--acc'), width:1.4, fill:true},
     {pts:rw.map(p=>[p.ts,p.tx_mbps]), color:css('--acc2'), width:1},
     {pts:t.map(p=>[p.ts,p.mbps]), color:css('--ok'), width:2},
+    {pts:t.map(p=>[p.ts,p.up_mbps]), color:css('--warn'), width:2},
   ], {tMin: now-wanHours*3600, tMax: now, lMax: top});
+  $('#tp-legend-up').hidden = !hasUp;
 }
 async function loadMachine(){
   const m = await j('/api/machine?hours='+wanHours);
@@ -648,6 +659,11 @@ async function loadReport(){
   if(r.plan_mbps){ const pc=r.pct_of_plan; tile('Delivered vs plan', pc==null?'—':pc+'%', 'avg '+num(sp.avg,1)+' of '+num(r.plan_mbps,0)+' Mbps · '+sp.samples+' tests', pc==null?'':pc>=85?'ok':pc>=60?'warn':'bad', p?delta(pc,p.pct_of_plan,true,pctI):''); }
   else tile('Average speed', sp.avg==null?'—':num(sp.avg,1)+' Mbps', 'set PLAN_DOWN_MBPS to compare with your plan · '+sp.samples+' tests', 'acc', p?delta(sp.avg,p.speed.avg,true,mb):'');
   tile('Slowest 10%', sp.p10==null?'—':num(sp.p10,1)+' Mbps', r.worst_speed_day?('worst day '+r.worst_speed_day.date+' · '+num(r.worst_speed_day.mbps,1)+' Mbps avg'):('min '+num(sp.min,1)+' · max '+num(sp.max,1)), sp.p10==null?'':(r.plan_mbps&&sp.p10<0.5*r.plan_mbps)?'bad':'', p?delta(sp.p10,p.speed.p10,true,mb):'');
+  const u=r.upload||{};
+  if(u.samples){ const upc=r.up_pct_of_plan;
+    tile('Upload', u.avg==null?'—':num(u.avg,1)+' Mbps',
+      (upc!=null ? upc+'% of your '+num(r.plan_up_mbps,0)+' Mbps · ' : '')+'slowest 10% '+num(u.p10,1)+' · '+u.samples+' tests',
+      upc==null?'acc':upc>=85?'ok':upc>=60?'warn':'bad', p&&p.upload?delta(u.avg,p.upload.avg,true,mb):''); }
   tile('Packet loss', num(r.loss_avg,2)+'%', 'to 1.1.1.1 · max rtt '+num(r.rtt_max,0)+' ms', r.loss_avg<0.5?'ok':r.loss_avg<3?'warn':'bad', p?delta(r.loss_avg,p.loss_avg,false,pct1):'');
   tile('WiFi disconnects', r.wifi_drops.toLocaleString(), 'logged by the router', r.wifi_drops>200?'warn':'', p?delta(r.wifi_drops,p.wifi_drops,false,n0):'');
 }
@@ -762,7 +778,7 @@ $('#copy-isp').addEventListener('click', copyForISP);
 $('#test-now').addEventListener('click', async e=>{ e.stopPropagation(); const b=e.currentTarget; b.disabled=true; b.textContent='testing…';
   try{ const r = await (await fetch('/api/speedtest',{method:'POST'})).json();
     if(r.skipped){ b.textContent='skipped'; $('#t-tp-s').textContent = r.reason+' — try again in a minute'; }
-    else { b.textContent=num(r.mbps,0)+' Mbps'; loadOverview(); loadThroughput(); }
+    else { b.textContent=num(r.mbps,0)+(r.up_mbps!=null?' / '+num(r.up_mbps,0):'')+' Mbps'; loadOverview(); loadThroughput(); }
   }catch(err){ b.textContent='failed'; }
   setTimeout(()=>{ b.textContent='test now'; b.disabled=false; }, 4000); });
 async function loadEvents(){

@@ -52,7 +52,7 @@ It's careful about blame: a service that fails while your own line is saturated 
 
 When the line is saturated the verdict names the device responsible: *"line saturated — 19 Mbps, that's all of it, Laptop 1 alone is pulling 15."*
 
-**Last 30 days** — the numbers for the ISP conversation: uptime %, outage count and longest, **delivered vs plan** (set `PLAN_DOWN_MBPS`), slowest-10% speed, worst day, packet loss, WiFi disconnects. It only counts the time it was actually watching (`based on N days of data`), so a fresh install doesn't report a fictional month.
+**Last 30 days** — the numbers for the ISP conversation: uptime %, outage count and longest, **delivered vs plan** (set `PLAN_DOWN_MBPS` / `PLAN_UP_MBPS`), slowest-10% speed, upload, worst day, packet loss, WiFi disconnects. It only counts the time it was actually watching (`based on N days of data`), so a fresh install doesn't report a fictional month.
 
 **Click any device** in the Devices or WiFi tables to expand its last 24h: signal strength, download rate, and each disconnect drawn as a red bar whose height is the signal at the moment it dropped. `?device=AA:BB:CC:DD:EE:FF` deep-links straight to one. This is how you answer *"was the phone on weak signal during that call?"*
 
@@ -62,7 +62,9 @@ When the line is saturated the verdict names the device responsible: *"line satu
 
 **Copy for ISP** — one button on the report builds a plain-text summary (uptime, outage list with timestamps, delivered vs plan, worst day) and puts it on the clipboard for the support chat.
 
-**Test now** — runs a speed test on demand from the throughput tile. Still refuses if the line is busy: a test that competes with a stream measures the wrong thing and ruins the stream.
+**Test now** — runs a speed test on demand from the throughput tile. Still refuses if the line is busy *in either direction*: a test that competes with a stream measures the wrong thing and ruins the stream.
+
+**Upload** — off by default, since on an asymmetric line it measures little and saturating the uplink hurts everything else in the house. Set `UPLOAD_TEST=1` and `PLAN_UP_MBPS` on a symmetric line and the tile reads `27 / 29 Mbps` with `90% / 97% of your 30/30 plan`, the chart gains an upload series, and the 30-day report gains an Upload card. The tile colours on the **worse** of the two directions — a healthy download shouldn't hide a broken upload.
 
 **vs last period** — every report tile carries a ▲/▼ against the previous 30 days once there's enough history, so you can tell whether fixing the mesh or phoning the ISP actually changed anything.
 
@@ -94,7 +96,7 @@ When the line is saturated the verdict names the device responsible: *"line satu
 | Source | How | Interval |
 |---|---|---|
 | WAN health | `ping -c10 -i0.2` to gateway, ISP box, and `1.1.1.1` | 60s |
-| Throughput | 5 MB download from Cloudflare — **skipped if the line is already busy**, so it never fights a stream or misreports | 15 min |
+| Throughput | Download from Cloudflare, plus an upload test when `UPLOAD_TEST=1` — **skipped if the line is busy in either direction**, so it never fights a stream or misreports | 15 min |
 | Host machine | `/proc`, thermal zones, `sensors`, NIC byte deltas | 60s |
 | Services | `curl` per service with `%{time_namelookup}`/`connect`/`starttransfer` and `%{exitcode}` | 2 min |
 | Pi-hole v6 | REST API over loopback HTTP, proxied live (session cached, re-auth on 401) | on page load |
@@ -178,7 +180,7 @@ Everything the page uses is plain JSON, handy for `curl` when something looks wr
 | `/api/router/signal?mac=…&hours=24` | One device's signal + rate points and its disconnects |
 | `/api/devices/usage?days=30` | Approximate GB down/up per device |
 | `PUT /api/devices/name` `{mac, name}` | Set a manual name (empty name clears it) |
-| `POST /api/speedtest` | Run a speed test now; `{skipped, reason}` if the line is busy |
+| `POST /api/speedtest` | Run a speed test now (both directions when enabled); `{skipped, reason}` if the line is busy |
 | `/api/heatmap?days=7&metric=loss` | day × hour cells plus the worst hours (`loss` / `rtt` / `jitter`) |
 | `/api/hogs?hours=24` | Processes over the CPU threshold now, and any seen in the window |
 | `/api/tailscale?hours=24` | Exit-node relay traffic, GB over the window, per-peer totals |
