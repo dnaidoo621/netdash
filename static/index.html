@@ -76,7 +76,7 @@
   .list .t{color:var(--muted);font-variant-numeric:tabular-nums;font-size:12px;flex:0 0 118px}
   .list .k{font-weight:600;flex:0 0 auto}
   .list .d{color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .k.internet_down,.k.wan_offline,.k.host_down{color:var(--bad)}.k.internet_up,.k.wan_online,.k.host_up{color:var(--ok)}.k.packet_loss,.k.router_reboot,.k.cpu_hog{color:var(--warn)}.k.new_device{color:var(--acc2)}
+  .k.internet_down,.k.wan_offline,.k.host_down{color:var(--bad)}.k.internet_up,.k.wan_online,.k.host_up{color:var(--ok)}.k.packet_loss,.k.router_reboot,.k.cpu_hog{color:var(--warn)}.k.dns_trouble{color:var(--bad)}.k.dns_ok{color:var(--ok)}.k.new_device{color:var(--acc2)}
   .k.CONNECTION_ERROR,.k.collector_error{color:var(--warn)}
   .range{display:inline-flex;gap:4px}
   .range button{background:var(--panel2);color:var(--dim);border:1px solid var(--line);
@@ -413,11 +413,18 @@ async function loadOverview(){
   const sv=o.services||{};
   if(sv.total){ const allUp = sv.up===sv.total;
     $('#t-svc').innerHTML = '<span class="'+(allUp?'ok':sv.down.length?'bad':'warn')+'">'+sv.up+'/'+sv.total+'</span>';
-    $('#t-svc-s').textContent = allUp ? 'all reachable from here' : (sv.down.length ? 'down: '+sv.down.join(', ') : 'one blip, re-checking'); }
+    const failing = sv.failing||[], mass = failing.length >= Math.max(3, Math.floor(sv.total/2));
+    $('#t-svc-s').textContent = allUp ? 'all reachable from here'
+      : sv.recovering ? 'internet just came back — re-checking'
+      : mass ? failing.length+' failing at once — our side, not theirs'
+      : (sv.down.length ? 'down: '+sv.down.join(', ') : 'one blip, re-checking'); }
 
   if(inet){ const lat=inet.rtt_avg; $('#t-lat').textContent = lat==null?'—':num(lat,1)+' ms';
     $('#t-lat').className='v '+(lat==null?'bad':lat<30?'ok':lat<80?'warn':'bad');
-    $('#t-lat-s').textContent = 'jitter '+num(inet.jitter,1)+' ms · gateway '+num(gw?.rtt_avg,2)+' ms'; }
+    // DNS rides along here rather than in a ninth tile (TV mode is 4 per row).
+    const dq=o.latest.dns, dnsTxt = !dq ? '' : (dq.loss>=40 || (dq.rtt_avg||0)>=1000)
+      ? ' · <span class="bad">DNS failing</span>' : ' · DNS '+num(dq.rtt_avg,0)+' ms';
+    $('#t-lat-s').innerHTML = 'jitter '+num(inet.jitter,1)+' ms · gateway '+num(gw?.rtt_avg,2)+' ms'+dnsTxt; }
   const d=o.day||{}; const loss=d.loss??0;
   $('#t-loss').textContent = num(loss,2)+'%'; $('#t-loss').className='v '+(loss<0.5?'ok':loss<3?'warn':'bad');
   $('#t-loss-s').textContent = (d.outages||0)+' outage probe'+((d.outages||0)===1?'':'s')+' · max rtt '+num(d.rtt_max,0)+' ms';

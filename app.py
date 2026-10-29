@@ -8,9 +8,13 @@ is precisely when you'll be looking at it.
 """
 import asyncio
 import os
+import random
 import re
 import shlex
+import socket
 import sqlite3
+import statistics
+import struct
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -32,6 +36,13 @@ PIHOLE_PASSWORD = os.environ.get("PIHOLE_PASSWORD", "")
 GATEWAY = os.environ.get("GATEWAY", "192.168.10.1")
 ISP_BOX = os.environ.get("ISP_BOX", "192.168.1.1")
 INTERNET = os.environ.get("INTERNET_TARGET", "1.1.1.1")
+# DNS probe. DNS_SERVER is what the house resolves through (Pi-hole); DNS_UPSTREAM is the
+# same check sent straight past it, so a failure can be pinned on one side or the other.
+# Both send A and AAAA back-to-back from one socket, as getaddrinfo() does — a pattern
+# some NAT boxes mangle while one-query-at-a-time dig sails through. Blank disables.
+DNS_SERVER = os.environ.get("DNS_SERVER", "127.0.0.1")
+DNS_UPSTREAM = os.environ.get("DNS_UPSTREAM", INTERNET)
+DNS_PROBE_NAME = os.environ.get("DNS_PROBE_NAME", "www.google.com")
 IFACE = os.environ.get("IFACE", "enp2s0")
 PROBE_INTERVAL = int(os.environ.get("PROBE_INTERVAL", "60"))
 THROUGHPUT_INTERVAL = int(os.environ.get("THROUGHPUT_INTERVAL", "900"))
@@ -59,6 +70,7 @@ SYSLOG_INTERVAL = int(os.environ.get("SYSLOG_INTERVAL", "300"))
 SERVICE_INTERVAL = int(os.environ.get("SERVICE_INTERVAL", "120"))
 
 TARGETS = {"gateway": GATEWAY, "isp": ISP_BOX, "internet": INTERNET}
+DNS_TARGETS = {k: v for k, v in (("dns", DNS_SERVER), ("dns_upstream", DNS_UPSTREAM)) if v}
 
 # Service catalog: (name, check URL, Pi-hole domain patterns). Which of these get
 # checked is decided automatically from what the house actually resolves — see
@@ -317,17 +329,27 @@ async def ping(target: str, count: int = 10) -> dict:
     return {"sent": sent, "recv": recv, "loss": loss, **rtt}
 
 
+def transfer_mbps(out: str) -> float | None:
+    """Mbps over the transfer alone, from curl's "size pretransfer total". curl's own
+    speed_* figures divide by total time, DNS and TLS included — so a single 5 s DNS
+    stall turned a 29 Mbps line into a "16 Mbps" reading."""
+    try:
+        size, pre, total = (float(x) for x in out.split()[:3])
+    except ValueError:
+        return None
+    secs = total - pre
+    if size <= 0 or secs <= 0:
+        return None
+    return round(size * 8 / secs / 1_000_000, 1)
+
+
 async def throughput_mbps() -> float | None:
     out = await run(
         ["curl", "-o", "/dev/null", "-s", "--max-time", "40",
-         "-w", "%{speed_download}", THROUGHPUT_URL],
+         "-w", "%{size_download} %{time_pretransfer} %{time_total}", THROUGHPUT_URL],
         timeout=45,
     )
-    try:
-        bps = float(out.strip())
-    except ValueError:
-        return None
-    return round(bps * 8 / 1_000_000, 1) if bps > 0 else None
+    return transfer_mbps(out)
 
 
 async def upload_mbps() -> float | None:
@@ -338,7 +360,8 @@ async def upload_mbps() -> float | None:
     proc = await asyncio.create_subprocess_shell(
         f"head -c {size} /dev/zero | curl -o /dev/null -s --max-time 40 "
         f"-X POST -H 'Content-Type: application/octet-stream' "
-        f"--data-binary @- -w '%{{speed_upload}}' {shlex.quote(UPLOAD_URL)}",
+        f"--data-binary @- -w '%{{size_upload}} %{{time_pretransfer}} %{{time_total}}' "
+        f"{shlex.quote(UPLOAD_URL)}",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
     )
     try:
@@ -346,11 +369,57 @@ async def upload_mbps() -> float | None:
     except asyncio.TimeoutError:
         proc.kill()
         return None
+    return transfer_mbps(out.decode())
+
+
+def _dns_query(qid: int, name: str, qtype: int) -> bytes:
+    qname = b"".join(bytes([len(p)]) + p.encode() for p in name.rstrip(".").split(".")) + b"\0"
+    return struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0) + qname + struct.pack(">HH", qtype, 1)
+
+
+def dns_pair(server: str, name: str, timeout: float = 2.0) -> float | None:
+    """A and AAAA back-to-back from one socket, as getaddrinfo() sends them. Returns ms
+    until both answers are in, or None if either never came."""
+    fam, _, _, _, addr = socket.getaddrinfo(server, 53, type=socket.SOCK_DGRAM)[0]
+    s = socket.socket(fam, socket.SOCK_DGRAM)
     try:
-        bps = float(out.decode().strip())
-    except ValueError:
-        return None
-    return round(bps * 8 / 1_000_000, 1) if bps > 0 else None
+        a, b = random.sample(range(65536), 2)
+        t0 = time.monotonic()
+        s.sendto(_dns_query(a, name, 1), addr)
+        s.sendto(_dns_query(b, name, 28), addr)
+        want = {a, b}
+        while want:
+            left = t0 + timeout - time.monotonic()
+            if left <= 0:
+                return None
+            s.settimeout(left)
+            try:
+                data, _ = s.recvfrom(4096)
+            except OSError:          # timeout, or ICMP unreachable
+                return None
+            if len(data) >= 12:
+                want.discard(struct.unpack(">H", data[:2])[0])
+        return (time.monotonic() - t0) * 1000
+    finally:
+        s.close()
+
+
+async def dns_probe(server: str, pairs: int = 5) -> dict:
+    """Probe-shaped (loss %, rtt) so DNS shares the probes table and rollups with ping."""
+    times = []
+    for _ in range(pairs):
+        try:
+            ms = await asyncio.to_thread(dns_pair, server, DNS_PROBE_NAME)
+        except OSError:
+            ms = None
+        if ms is not None:
+            times.append(ms)
+    rtt = {"rtt_avg": None, "rtt_max": None, "jitter": None}
+    if times:
+        rtt = {"rtt_avg": round(sum(times) / len(times), 1), "rtt_max": round(max(times), 1),
+               "jitter": round(statistics.pstdev(times), 1)}
+    return {"sent": pairs, "recv": len(times),
+            "loss": round(100 * (pairs - len(times)) / pairs, 1), **rtt}
 
 
 async def check_service(name: str, url: str) -> dict:
@@ -504,6 +573,7 @@ class Collector:
     def __init__(self):
         self.internet_up: bool | None = None
         self.last_loss_event = 0
+        self.dns_bad: dict[str, bool] = {}
         self.last_nic = (0, 0, 0.0)  # rx, tx, ts
         self.last_throughput = 0.0
         self.last_router_wan: tuple[float, int, int] | None = None
@@ -687,8 +757,13 @@ class Collector:
         ts = int(time.time())
         if not self.services_active:
             await self.detect_services()
+        async def staggered(i: int, svc: dict) -> dict:
+            # Spread the round over a few seconds: 19 simultaneous curls on an old laptop
+            # measure their own pile-up (lookups ~90 ms instead of ~5 ms), not the sites.
+            await asyncio.sleep(i * 0.25)
+            return await check_service(svc["name"], svc["url"])
         results = await asyncio.gather(
-            *(check_service(s["name"], s["url"]) for s in self.services_active))
+            *(staggered(i, s) for i, s in enumerate(self.services_active)))
         with db() as conn:
             conn.executemany(
                 "INSERT INTO services VALUES (?,?,?,?,?,?,?,?)",
@@ -721,6 +796,8 @@ class Collector:
         results = {}
         for name, target in TARGETS.items():
             results[name] = await ping(target)
+        dns = await asyncio.gather(*(dns_probe(s) for s in DNS_TARGETS.values()))
+        results.update(zip(DNS_TARGETS, dns))
         with db() as conn:
             for name, r in results.items():
                 conn.execute(
@@ -729,6 +806,27 @@ class Collector:
                      r["rtt_avg"], r["rtt_max"], r["jitter"]),
                 )
         self.detect_outage(ts, results)
+        self.detect_dns(results)
+
+    def detect_dns(self, results: dict):
+        """One event when a resolver starts losing answers and one when it recovers, with
+        a gap between the thresholds so a borderline minute doesn't flap."""
+        for name, server in DNS_TARGETS.items():
+            r = results.get(name)
+            if not r:
+                continue
+            bad = dns_trouble(r)
+            good = r["loss"] < 20 and (r["rtt_avg"] or 0) < 500
+            was = self.dns_bad.get(name, False)
+            if bad and not was:
+                self.dns_bad[name] = True
+                side = ("what the house uses" if name == "dns"
+                        else "direct, bypassing Pi-hole")
+                add_event("dns_trouble", f"DNS via {server} ({side}): {r['loss']:.0f}% of "
+                                         f"lookups unanswered, {r['rtt_avg'] or 0:.0f} ms")
+            elif good and was:
+                self.dns_bad[name] = False
+                add_event("dns_ok", f"DNS via {server} answering normally again")
 
     def detect_outage(self, ts: int, results: dict):
         inet = results["internet"]
@@ -934,7 +1032,7 @@ async def index():
 @app.get("/api/overview")
 async def overview():
     latest = {}
-    for name in TARGETS:
+    for name in [*TARGETS, *DNS_TARGETS]:
         r = rows("SELECT * FROM probes WHERE target=? ORDER BY ts DESC LIMIT 1",
                  name)
         latest[name] = r[0] if r else None
@@ -957,13 +1055,25 @@ async def overview():
                     if d.get("signal_db") is not None and d["signal_db"] < 25)
     hog = max(collector.router_devices_now, key=lambda d: d.get("down_kbps") or 0, default=None)
     hog_mbps = (hog["down_kbps"] / 1000) if hog and hog.get("down_kbps") else None
+    # Share of the last 10 min of service checks whose lookup hit a resolver retry.
+    st = rows("SELECT COUNT(*) n, AVG(dns_ms >= 4500) f FROM services "
+              "WHERE ts>? AND dns_ms IS NOT NULL", since(1 / 6))[0]
+    lookup_stall = (st["f"] or 0.0) if (st["n"] or 0) >= 10 else 0.0
+    # The ping probe runs every minute, the service checks every two: right after the
+    # internet comes back the services panel can still be showing the failed round.
+    last_round = rows("SELECT MAX(ts) m FROM services")[0]["m"] or 0
+    back = rows("SELECT MAX(ts) m FROM events WHERE kind='internet_up'")[0]["m"] or 0
+    recovering = bool(back and last_round < back and time.time() - back < SERVICE_INTERVAL + 60)
+    failing = [s["name"] for s in svcs if not s["ok"] and s["reason"]]
     v = verdict(internet_up, inet["loss"] if inet else 0.0, gw["loss"] if gw else 0.0,
                 svcs, wifi_weak, "error" not in summary,
                 router.logged_in and not router.last_error,
                 line_used=rw[0]["rx_mbps"] if rw else None,
                 line_cap=tp[0]["mbps"] if tp else None,
                 hog_mbps=hog_mbps,
-                cpu_hog=collector.hogs_now[0] if collector.hogs_now else None)
+                cpu_hog=collector.hogs_now[0] if collector.hogs_now else None,
+                dns=latest.get("dns"), dns_up=latest.get("dns_upstream"),
+                lookup_stall=lookup_stall, recovering=recovering)
     if "{hog}" in v["text"] and hog:
         v["hog"] = {"name": best_name(hog.get("mac", ""), hog.get("name")), "mac": hog.get("mac"),
                     "ip": hog.get("ip"), "mbps": round(hog_mbps or 0, 1)}
@@ -974,7 +1084,9 @@ async def overview():
         "plan_mbps": PLAN_DOWN_MBPS or None,
         "plan_up_mbps": PLAN_UP_MBPS or None,
         "services": {"up": sum(1 for s in svcs if s["ok"]), "total": len(svcs),
-                     "down": [s["name"] for s in svcs if s["down"]]},
+                     "down": [s["name"] for s in svcs if s["down"]],
+                     "failing": failing, "recovering": recovering},
+        "dns": {"targets": DNS_TARGETS, "lookup_stall": round(lookup_stall, 3)},
         "latest": latest,
         "throughput": tp[0] if tp else None,
         "machine": mc[0] if mc else None,
@@ -1097,10 +1209,16 @@ def build_incidents(hours: float) -> list[dict]:
     return merged
 
 
+def dns_trouble(r: dict | None) -> bool:
+    return bool(r and (r["loss"] >= 40 or (r["rtt_avg"] or 0) >= 1000))
+
+
 def verdict(internet_up: bool, inet_loss: float, gw_loss: float,
             svcs: list[dict], wifi_weak: int, pihole_ok: bool, router_ok: bool,
             line_used: float | None = None, line_cap: float | None = None,
-            hog_mbps: float | None = None, cpu_hog: dict | None = None) -> dict:
+            hog_mbps: float | None = None, cpu_hog: dict | None = None,
+            dns: dict | None = None, dns_up: dict | None = None,
+            lookup_stall: float = 0.0, recovering: bool = False) -> dict:
     """One sentence that says whose problem it is. "{hog}" is filled in by the client so
     demo mode can anonymise the device name."""
     if not internet_up:
@@ -1109,6 +1227,7 @@ def verdict(internet_up: bool, inet_loss: float, gw_loss: float,
         return {"level": "bad", "text": "Internet down — your router is fine, the line to the ISP is out"}
     parts, level = [], "ok"
     down = [s["name"] for s in svcs if s["down"]]
+    failing = [s["name"] for s in svcs if not s["ok"] and s["reason"]]
     lossy = inet_loss >= 5
     # 80%, not higher: the WAN figure is a 60s average that includes ramp-up, so a line
     # that is effectively full reads 80–90%. Verified against a forced 17 Mbps download.
@@ -1123,12 +1242,37 @@ def verdict(internet_up: bool, inet_loss: float, gw_loss: float,
         who = (f", {{hog}} alone is pulling {hog_mbps:.0f}"
                if hog_mbps and hog_mbps >= 0.5 * line_used else "")
         parts.append(f"line saturated — {how}{who}; anything else will buffer"); level = "warn"
-    if down:
+    # DNS before services: when lookups fail, every service "fails" with it.
+    dns_bad = dns_trouble(dns)
+    stalling = lookup_stall >= 0.3
+    if dns_bad:
+        who = (" — it's Pi-hole itself, the upstream answers fine"
+               if dns_up and not dns_trouble(dns_up) else "")
+        parts.append(f"DNS isn't answering reliably ({dns['loss']:.0f}% of lookups lost){who} — "
+                     f"pages will hang before they load"); level = "bad"
+    elif stalling:
+        where = (f" — {DNS_SERVER} answers fine, so check this box's /etc/resolv.conf"
+                 if dns and not dns_trouble(dns) else "")
+        parts.append(f"{lookup_stall:.0%} of this box's lookups are stalling 5 s{where}")
+        level = "warn"
+    # Many unrelated services failing in the same round is never all of them at once.
+    mass = len(failing) >= max(3, len(svcs) // 2)
+    if failing and recovering:
+        parts.append("internet just came back — re-checking services")
+        level = "warn" if level == "ok" else level
+    elif mass:
+        cause = ("DNS" if dns_bad or stalling else "the packet loss" if lossy
+                 else "the saturated line" if saturated else "something between here and the internet")
+        parts.append(f"{len(failing)} of {len(svcs)} services failing at once — that's {cause}, "
+                     f"not them"); level = "bad"
+    elif down:
         who = ", ".join(down)
         verb = "is" if len(down) == 1 else "are"
         # Only blame the service when our own line is clean. A saturated or lossy line
         # starves the checks too, and that's on us.
-        if saturated:
+        if dns_bad or stalling:
+            parts.append(f"{who} {verb} unreachable — probably DNS, not them")
+        elif saturated:
             parts.append(f"{who} {verb} unreachable — probably the saturated line, not them")
         elif lossy:
             parts.append(f"{who} {verb} unreachable — probably the packet loss, not them")
@@ -1380,8 +1524,18 @@ async def router_signal(mac: str, hours: float = Query(24, ge=1, le=MAX_HOURS)):
 async def wan(hours: float = Query(24, ge=1, le=MAX_HOURS)):
     t = "probes" if raw_ok(hours) else "probes_h"
     return {"since": since(hours), "source": t,
-            "probes": rows(f"SELECT ts,target,loss,rtt_avg,rtt_max,jitter "
-                           f"FROM {t} WHERE ts>? ORDER BY ts", since(hours))}
+            "probes": rows(f"SELECT ts,target,loss,rtt_avg,rtt_max,jitter FROM {t} "
+                           f"WHERE ts>? AND target IN ('gateway','isp','internet') ORDER BY ts",
+                           since(hours))}
+
+
+@app.get("/api/dns")
+async def dns_history(hours: float = Query(24, ge=1, le=MAX_HOURS)):
+    t = "probes" if raw_ok(hours) else "probes_h"
+    return {"since": since(hours), "source": t, "targets": DNS_TARGETS,
+            "probes": rows(f"SELECT ts,target,loss,rtt_avg,rtt_max FROM {t} "
+                           f"WHERE ts>? AND target IN ('dns','dns_upstream') ORDER BY ts",
+                           since(hours))}
 
 
 @app.get("/api/throughput")

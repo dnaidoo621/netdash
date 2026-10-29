@@ -34,7 +34,13 @@ Built for a low-power always-on box (in my case an old laptop running Pi-hole an
 > *line saturated — 17 of 18 Mbps in use, anything else will buffer*
 > *Internet down — your router is fine, the line to the ISP is out*
 
-It's careful about blame: a service that fails while your own line is saturated or lossy is reported as *"probably the saturated line, not them."*
+It's careful about blame: a service that fails while your own line is saturated or lossy is reported as *"probably the saturated line, not them."* When half the services fail in the same round it never blames them — fourteen unrelated companies don't go down in the same minute:
+
+> *14 of 19 services failing at once — that's DNS, not them*
+
+And for the minute after an outage, when the ping probe has recovered but the last service round hasn't re-run yet, it says *"internet just came back — re-checking services"* rather than showing an up internet next to a wall of red.
+
+**DNS, measured directly.** Every minute netdash sends A + AAAA queries back-to-back from one socket — exactly what `getaddrinfo()` does for every app — to Pi-hole and, separately, straight to the upstream. A one-query-at-a-time `dig` can pass while that pair fails: some NAT boxes drop the second of two near-identical UDP packets, and every lookup then waits out the resolver's 5 s timeout. That looked like a slow line here for a week (pages hanging, speed tests at half) before this probe existed. DNS shows on the latency tile, raises `dns_trouble` / `dns_ok` events, and the verdict says whether it's Pi-hole itself or the path beyond it.
 
 **Top row — the glance**
 - Internet status pill (turns red and pulses on outage)
@@ -96,9 +102,10 @@ When the line is saturated the verdict names the device responsible: *"line satu
 | Source | How | Interval |
 |---|---|---|
 | WAN health | `ping -c10 -i0.2` to gateway, ISP box, and `1.1.1.1` | 60s |
-| Throughput | Download from Cloudflare, plus an upload test when `UPLOAD_TEST=1` — **skipped if the line is busy in either direction**, so it never fights a stream or misreports | 15 min |
+| DNS | 5 A+AAAA pairs to `DNS_SERVER` (Pi-hole) and to `DNS_UPSTREAM`, 2 s timeout each | 60s |
+| Throughput | Download from Cloudflare, plus an upload test when `UPLOAD_TEST=1` — **skipped if the line is busy in either direction**, so it never fights a stream or misreports. Timed over the transfer only: curl's own `speed_*` includes DNS and TLS, so one slow lookup used to halve the reading | 15 min |
 | Host machine | `/proc`, thermal zones, `sensors`, NIC byte deltas | 60s |
-| Services | `curl` per service with `%{time_namelookup}`/`connect`/`starttransfer` and `%{exitcode}` | 2 min |
+| Services | `curl` per service with `%{time_namelookup}`/`connect`/`starttransfer` and `%{exitcode}`, staggered 0.25 s apart so the checks don't measure their own pile-up | 2 min |
 | Pi-hole v6 | REST API over loopback HTTP, proxied live (session cached, re-auth on 401) | on page load |
 | Cudy router | Stock-firmware web endpoints (see below) | 60s; syslog every 5 min |
 
@@ -184,7 +191,8 @@ Everything the page uses is plain JSON, handy for `curl` when something looks wr
 | `/api/heatmap?days=7&metric=loss` | day × hour cells plus the worst hours (`loss` / `rtt` / `jitter`) |
 | `/api/hogs?hours=24` | Processes over the CPU threshold now, and any seen in the window |
 | `/api/tailscale?hours=24` | Exit-node relay traffic, GB over the window, per-peer totals |
-| `/api/wan?hours=24` | Probe timeseries (loss, rtt, jitter) per target |
+| `/api/wan?hours=24` | Probe timeseries (loss, rtt, jitter) per ping target |
+| `/api/dns?hours=24` | DNS probe timeseries: answers lost % and ms, for Pi-hole and the upstream |
 | `/api/throughput?hours=24` | Speed-test samples |
 | `/api/router/wan?hours=24` | Router WAN Mbps timeseries |
 | `/api/router/devices` | Live per-device band / signal / rate |
