@@ -574,6 +574,7 @@ class Collector:
         self.internet_up: bool | None = None
         self.last_loss_event = 0
         self.dns_bad: dict[str, bool] = {}
+        self.dns_bad_run: dict[str, int] = {}
         self.last_nic = (0, 0, 0.0)  # rx, tx, ts
         self.last_throughput = 0.0
         self.last_router_wan: tuple[float, int, int] | None = None
@@ -810,20 +811,24 @@ class Collector:
 
     def detect_dns(self, results: dict):
         """One event when a resolver starts losing answers and one when it recovers, with
-        a gap between the thresholds so a borderline minute doesn't flap."""
+        a gap between the thresholds so a borderline minute doesn't flap. The upstream
+        has to stay bad for 3 minutes: the house doesn't use it directly, and it has
+        minute-long blackouts that Pi-hole rides out without anyone noticing."""
         for name, server in DNS_TARGETS.items():
             r = results.get(name)
             if not r:
                 continue
             bad = dns_trouble(r)
             good = r["loss"] < 20 and (r["rtt_avg"] or 0) < 500
+            run = self.dns_bad_run[name] = self.dns_bad_run.get(name, 0) + 1 if bad else 0
             was = self.dns_bad.get(name, False)
-            if bad and not was:
+            if bad and not was and run >= (1 if name == "dns" else 3):
                 self.dns_bad[name] = True
                 side = ("what the house uses" if name == "dns"
                         else "direct, bypassing Pi-hole")
+                ms = f", {r['rtt_avg']:.0f} ms" if r["rtt_avg"] is not None else ""
                 add_event("dns_trouble", f"DNS via {server} ({side}): {r['loss']:.0f}% of "
-                                         f"lookups unanswered, {r['rtt_avg'] or 0:.0f} ms")
+                                         f"lookups unanswered{ms}")
             elif good and was:
                 self.dns_bad[name] = False
                 add_event("dns_ok", f"DNS via {server} answering normally again")
