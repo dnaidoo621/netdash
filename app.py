@@ -216,6 +216,9 @@ def db():
 
 def init_db():
     with db() as conn:
+        # WAL so a long read (a report, or someone querying the file by hand) never
+        # blocks the collector's writes. Persistent: set once, stays on the file.
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
         # Migrations for databases created before a column existed. Adding a column is
         # cheap and keeps old rows (they read back as NULL, which the UI renders as "—").
@@ -961,7 +964,12 @@ class Collector:
                     rollup()
                     prune()
             except Exception as e:  # keep the loop alive no matter what
-                add_event("collector_error", str(e)[:200])
+                try:
+                    add_event("collector_error", str(e)[:200])
+                except Exception:
+                    # Recording the error can fail for the same reason (database locked);
+                    # raising here would end the loop and silently stop all collection.
+                    print(f"collector_error: {e}", flush=True)
             await asyncio.sleep(max(1, PROBE_INTERVAL - (time.time() - started)))
 
 
