@@ -174,6 +174,18 @@ Things that bit me, so you don't have to:
 
 It's unofficial. A firmware update could change the HTML, in which case the router panels go empty rather than anything breaking. The probes in `tools/` are what I used to reverse it — useful if you need to re-map endpoints or adapt to another Cudy model.
 
+### Changing router settings from the command line
+
+`tools/cudy.py` reuses the same logged-in client, so the password stays in `config.env`:
+
+```bash
+/opt/netdash/venv/bin/python /opt/netdash/tools/cudy.py qos                          # list per-device limits
+/opt/netdash/venv/bin/python /opt/netdash/tools/cudy.py qos set 192.168.10.50 --down 20
+/opt/netdash/venv/bin/python /opt/netdash/tools/cudy.py get admin/network/mesh/clients  # read any page as text
+```
+
+`qos set` only edits an existing rule and reads it back to confirm. It takes each rule's IP from the hidden text field, not the dropdown: when a capped device is offline its option is missing from the dropdown, and posting the form as the web UI renders it moves the rule to another device. `get` refuses paths with words like `detect`, `wizard` or `reboot` — the WAN detect page redials PPPoE just by being loaded.
+
 ## API
 
 Everything the page uses is plain JSON, handy for `curl` when something looks wrong:
